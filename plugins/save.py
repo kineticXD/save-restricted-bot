@@ -25,7 +25,8 @@ async def save_single(client: Client, message: Message):
     try:
         from main import user
         
-        # Safely resolve the peer ID so Pyrogram caches it
+        # Force the bot to recognize the group ID
+        await client.resolve_peer(target_chat)
         await user.resolve_peer(target_chat)
         
         source_msg = await user.get_messages(chat_id, msg_id)
@@ -66,7 +67,8 @@ async def save_batch(client: Client, message: Message):
     try:
         from main import user
         
-        # Safely resolve the peer ID so Pyrogram caches it
+        # Force the bot to recognize the group ID
+        await client.resolve_peer(target_chat)
         await user.resolve_peer(target_chat)
         
         success_count = 0
