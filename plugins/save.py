@@ -25,8 +25,8 @@ async def save_single(client: Client, message: Message):
     try:
         from main import user
         
-        # 🔥 THE FIX: Force Pyrogram to cache the target chat ID
-        await user.get_chat(target_chat)
+        # Safely resolve the peer ID so Pyrogram caches it
+        await user.resolve_peer(target_chat)
         
         source_msg = await user.get_messages(chat_id, msg_id)
         if not source_msg or source_msg.empty:
@@ -66,8 +66,8 @@ async def save_batch(client: Client, message: Message):
     try:
         from main import user
         
-        # 🔥 THE FIX: Force Pyrogram to cache the target chat ID
-        await user.get_chat(target_chat)
+        # Safely resolve the peer ID so Pyrogram caches it
+        await user.resolve_peer(target_chat)
         
         success_count = 0
         semaphore = asyncio.Semaphore(1) 
