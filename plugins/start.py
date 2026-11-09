@@ -5,7 +5,8 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-@Client.on_message(filters.command("start"))
+# The OWNER_ID restriction is back in place
+@Client.on_message(filters.command("start") & filters.user(OWNER_ID))
 async def start_handler(client: Client, message: Message):
     logger.info(f"🔥 Received /start command from User ID: {message.from_user.id}")
     
