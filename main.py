@@ -22,21 +22,24 @@ def run_flask():
     app.run(host='0.0.0.0', port=port)
 
 # --- Clients ---
-# Bot client (talks to you)
 bot = Client("SaveBot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN, plugins=dict(root="plugins"))
-
-# User client (fetches the restricted content)
 user = Client("SaveUser", api_id=API_ID, api_hash=API_HASH, session_string=SESSION_STRING)
 
 # --- Main Async Function ---
 async def main():
     logger.info("Starting User Client...")
     await user.start()
+    # Force Userbot to sync its dialogs (caches IDs)
+    logger.info("Syncing Userbot dialogs...")
+    await user.get_dialogs()
     
     logger.info("Starting Bot Client...")
     await bot.start()
+    # Force Bot to sync its dialogs (caches IDs)
+    logger.info("Syncing Bot dialogs...")
+    await bot.get_dialogs()
     
-    logger.info("🚀 Both clients started successfully. Bot is running!")
+    logger.info("🚀 Both clients started and synced successfully. Bot is running!")
     
     # This keeps the event loop running indefinitely for both clients
     await idle()
