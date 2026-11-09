@@ -1,9 +1,16 @@
 from pyrogram import Client, filters, enums
 from pyrogram.types import Message
 from config import OWNER_ID
+import logging
 
-@Client.on_message(filters.command("start") & filters.user(OWNER_ID))
+logger = logging.getLogger(__name__)
+
+# Note: We removed '& filters.user(OWNER_ID)' temporarily to test
+@Client.on_message(filters.command("start"))
 async def start_handler(client: Client, message: Message):
+    # This will print in your Railway logs every time someone sends /start
+    logger.info(f"🔥 Received /start command from User ID: {message.from_user.id}")
+    
     text = (
         "🚀 **Personal Save Bot**\n\n"
         "I can extract restricted content and post it directly here.\n\n"
