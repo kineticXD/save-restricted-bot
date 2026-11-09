@@ -25,27 +25,36 @@ def run_flask():
 bot = Client("SaveBot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN, plugins=dict(root="plugins"))
 user = Client("SaveUser", api_id=API_ID, api_hash=API_HASH, session_string=SESSION_STRING)
 
+# --- Background Dialog Syncing ---
+async def sync_dialogs():
+    """Runs in the background to cache chat IDs without blocking the bot."""
+    try:
+        logger.info("Syncing Userbot dialogs in background...")
+        async for _ in user.get_dialogs():
+            pass
+        logger.info("Syncing Bot dialogs in background...")
+        async for _ in bot.get_dialogs():
+            pass
+        logger.info("✅ Dialog sync complete. Peer IDs are cached.")
+    except Exception as e:
+        logger.error(f"Failed to sync dialogs: {e}")
+
 # --- Main Async Function ---
 async def main():
-    logger.info("Starting User Client...")
-    await user.start()
-    
-    # Force Userbot to sync its dialogs (caches IDs)
-    logger.info("Syncing Userbot dialogs...")
-    async for _ in user.get_dialogs():
-        pass # Looping through it forces Pyrogram to cache the chats
-        
+    # 1. Start the bot FIRST so it can reply immediately
     logger.info("Starting Bot Client...")
     await bot.start()
     
-    # Force Bot to sync its dialogs (caches IDs)
-    logger.info("Syncing Bot dialogs...")
-    async for _ in bot.get_dialogs():
-        pass
-        
-    logger.info("🚀 Both clients started and synced successfully. Bot is running!")
+    # 2. Start the userbot
+    logger.info("Starting User Client...")
+    await user.start()
     
-    # This keeps the event loop running indefinitely for both clients
+    logger.info("🚀 Both clients started successfully. Bot is running!")
+    
+    # 3. Run the dialog sync in the background so it doesn't block replies
+    asyncio.create_task(sync_dialogs())
+    
+    # 4. Keep the event loop alive
     await idle()
     
     logger.info("Stopping clients...")
