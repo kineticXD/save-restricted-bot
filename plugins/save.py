@@ -25,13 +25,14 @@ async def save_single(client: Client, message: Message):
     try:
         from main import user
         
-        # 1. Check if message exists and isn't a system message
+        # 🔥 THE FIX: Force Pyrogram to cache the target chat ID
+        await user.get_chat(target_chat)
+        
         source_msg = await user.get_messages(chat_id, msg_id)
         if not source_msg or source_msg.empty:
             await status_msg.edit_text("❌ Message not found. It might be a system message or deleted.")
             return
 
-        # 2. Instant server-side copy
         await safe_execute(
             user.copy_message,
             chat_id=target_chat,
@@ -64,8 +65,12 @@ async def save_batch(client: Client, message: Message):
 
     try:
         from main import user
+        
+        # 🔥 THE FIX: Force Pyrogram to cache the target chat ID
+        await user.get_chat(target_chat)
+        
         success_count = 0
-        semaphore = asyncio.Semaphore(1) # Concurrency limit
+        semaphore = asyncio.Semaphore(1) 
         errors = []
 
         async def process_one(msg_id):
@@ -87,12 +92,10 @@ async def save_batch(client: Client, message: Message):
                     errors.append(f"Msg {msg_id}: {str(e)}")
                 return False
 
-        # Process all messages in the range
         tasks = [process_one(mid) for mid in range(start_id, end_id + 1)]
         results = await asyncio.gather(*tasks)
         success_count = sum(results)
 
-        # Final Report
         report = f"✅ **Batch complete.**\nSent {success_count} / {end_id - start_id + 1} posts.\n"
         
         if errors:
