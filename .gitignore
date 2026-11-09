@@ -1,0 +1,11 @@
+# Environment variables
+.env
+
+# Pyrogram Session Files
+*.session
+*.session-journal
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
