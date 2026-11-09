@@ -1,8 +1,9 @@
 import os
 import logging
+import asyncio
 from threading import Thread
 from flask import Flask
-from pyrogram import Client
+from pyrogram import Client, idle
 from config import API_ID, API_HASH, BOT_TOKEN, SESSION_STRING
 
 # --- Logging Setup ---
@@ -27,12 +28,26 @@ bot = Client("SaveBot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN, p
 # User client (fetches the restricted content)
 user = Client("SaveUser", api_id=API_ID, api_hash=API_HASH, session_string=SESSION_STRING)
 
+# --- Main Async Function ---
+async def main():
+    logger.info("Starting User Client...")
+    await user.start()
+    
+    logger.info("Starting Bot Client...")
+    await bot.start()
+    
+    logger.info("🚀 Both clients started successfully. Bot is running!")
+    
+    # This keeps the event loop running indefinitely for both clients
+    await idle()
+    
+    logger.info("Stopping clients...")
+    await bot.stop()
+    await user.stop()
+
 if __name__ == "__main__":
     logger.info("Starting Keep-Alive Server...")
     Thread(target=run_flask, daemon=True).start()
     
-    logger.info("Starting User Client...")
-    user.start()
-    
-    logger.info("Starting Bot Client...")
-    bot.run()
+    # Run the async loop
+    asyncio.run(main())
