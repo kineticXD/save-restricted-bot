@@ -3,7 +3,7 @@ import logging
 import asyncio
 from threading import Thread
 from flask import Flask
-from pyrogram import Client, idle
+from pyrogram import Client, idle, filters
 from config import API_ID, API_HASH, BOT_TOKEN, SESSION_STRING
 
 # --- Logging Setup ---
@@ -25,16 +25,24 @@ def run_flask():
 bot = Client("SaveBot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN, plugins=dict(root="plugins"))
 user = Client("SaveUser", api_id=API_ID, api_hash=API_HASH, session_string=SESSION_STRING)
 
+# --- CATCH-ALL DEBUG HANDLER ---
+# This will trigger for ANY message the bot receives, bypassing all filters
+@bot.on_message(filters.all)
+async def debug_catch_all(client: Client, message):
+    logger.info(f"🚨 DEBUG: Bot received a message! Text: '{message.text}' from User ID: {message.from_user.id if message.from_user else 'Unknown'}")
+
 # --- Main Async Function ---
 async def main():
-    # Check if SESSION_STRING is valid before starting
     if not SESSION_STRING:
         logger.error("❌ CRITICAL ERROR: SESSION_STRING is missing in Railway Variables!")
-        logger.error("Please generate a new Pyrogram String and add it to your environment variables.")
         return
         
     logger.info("Starting Bot Client...")
     await bot.start()
+    
+    # Verify WHICH bot is actually connected
+    me = await bot.get_me()
+    logger.info(f"🤖 CONNECTED BOT IDENTITY: @{me.username} (ID: {me.id})")
     
     logger.info("Starting User Client...")
     await user.start()
