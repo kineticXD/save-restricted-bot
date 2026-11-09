@@ -1,7 +1,7 @@
 import asyncio
 import logging
-from pyrogram import Client, filters
-from pyrogram.types import Message, enums
+from pyrogram import Client, filters, enums
+from pyrogram.types import Message
 from config import OWNER_ID
 from plugins.helpers import extract_chat_and_msg_id, get_target_topic, safe_execute
 
@@ -23,7 +23,6 @@ async def save_single(client: Client, message: Message):
     status_msg = await message.reply_text("⏳ **Fetching...**")
 
     try:
-        # Import user client from main to avoid circular imports
         from main import user
         
         source_msg = await user.get_messages(chat_id, msg_id)
@@ -64,7 +63,7 @@ async def save_batch(client: Client, message: Message):
     try:
         from main import user
         success_count = 0
-        semaphore = asyncio.Semaphore(1) # Keep it at 1 for safety
+        semaphore = asyncio.Semaphore(1)
 
         async def process_one(msg_id):
             async with semaphore:
