@@ -67,19 +67,19 @@ async def safe_execute(func, *args, **kwargs):
     raise Exception("FloodWait retry failed.")
 
 def extract_chat_and_msg_id(link: str):
-    """Parse a t.me link to get chat ID and message ID."""
-    patterns = [
-        r'(?:https?://)?t\.me/(?:c/)?([^/]+)/(\d+)',
-        r'(?:https?://)?t\.me/([^/]+)/(\d+)',
-    ]
-    for pattern in patterns:
-        match = re.search(pattern, link)
-        if match:
-            chat_identifier = match.group(1)
-            msg_id = int(match.group(2))
-            if chat_identifier.isdigit():
-                chat_identifier = int(f"-100{chat_identifier}")
-            return chat_identifier, msg_id
+    """Parse a t.me link to get chat ID and message ID (handles Topic links)."""
+    # This regex handles: t.me/c/123456789/50 AND t.me/c/123456789/123/50
+    pattern = r'(?:https?://)?t\.me/(?:c/)?([^/]+)/(?:(\d+)/)?(\d+)'
+    
+    match = re.search(pattern, link)
+    if match:
+        chat_identifier = match.group(1)
+        msg_id = int(match.group(3)) # The last number is always the message ID
+        
+        if chat_identifier.isdigit():
+            chat_identifier = int(f"-100{chat_identifier}")
+            
+        return chat_identifier, msg_id
     return None, None
 
 async def get_target_topic(message: Message):
