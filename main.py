@@ -3,10 +3,9 @@ import logging
 import asyncio
 from threading import Thread
 from flask import Flask
-from pyrogram import Client, idle, filters
+from pyrogram import Client
 from config import API_ID, API_HASH, BOT_TOKEN, SESSION_STRING
 
-# --- Logging Setup ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
@@ -15,7 +14,7 @@ app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "Personal Save Bot is alive."
+    return "Alive"
 
 def run_flask():
     port = int(os.environ.get("PORT", 8080))
@@ -25,40 +24,26 @@ def run_flask():
 bot = Client("SaveBot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN, plugins=dict(root="plugins"))
 user = Client("SaveUser", api_id=API_ID, api_hash=API_HASH, session_string=SESSION_STRING)
 
-# --- CATCH-ALL DEBUG HANDLER ---
-# This will trigger for ANY message the bot receives, bypassing all filters
-@bot.on_message(filters.all)
-async def debug_catch_all(client: Client, message):
-    logger.info(f"🚨 DEBUG: Bot received a message! Text: '{message.text}' from User ID: {message.from_user.id if message.from_user else 'Unknown'}")
-
-# --- Main Async Function ---
-async def main():
-    if not SESSION_STRING:
-        logger.error("❌ CRITICAL ERROR: SESSION_STRING is missing in Railway Variables!")
-        return
-        
-    logger.info("Starting Bot Client...")
-    await bot.start()
-    
-    # Verify WHICH bot is actually connected
-    me = await bot.get_me()
-    logger.info(f"🤖 CONNECTED BOT IDENTITY: @{me.username} (ID: {me.id})")
-    
+# --- Userbot Runner ---
+def start_userbot():
     logger.info("Starting User Client...")
-    await user.start()
-    
-    logger.info("🚀 Both clients started successfully. Bot is running!")
-    
-    # Keep the event loop alive
-    await idle()
-    
-    logger.info("Stopping clients...")
-    await bot.stop()
-    await user.stop()
+    user.start()
+    logger.info("User Client started successfully.")
+    # Keep the userbot alive forever
+    asyncio.get_event_loop().run_forever()
 
+# --- Main ---
 if __name__ == "__main__":
-    logger.info("Starting Keep-Alive Server...")
+    if not SESSION_STRING:
+        logger.error("❌ CRITICAL ERROR: SESSION_STRING is missing!")
+        exit(1)
+
+    # Start Flask
     Thread(target=run_flask, daemon=True).start()
     
-    # Run the async loop
-    asyncio.run(main())
+    # Start Userbot in a background thread
+    Thread(target=start_userbot, daemon=True).start()
+    
+    # Start the Bot (bot.run() handles the event loop and polling automatically)
+    logger.info("Starting Bot Client...")
+    bot.run()
