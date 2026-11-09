@@ -25,6 +25,21 @@ def run_flask():
 bot = Client("SaveBot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN, plugins=dict(root="plugins"))
 user = Client("SaveUser", api_id=API_ID, api_hash=API_HASH, session_string=SESSION_STRING)
 
+# --- Background Sync ---
+async def sync_dialogs():
+    """Downloads the chat list in the background so the bot recognizes group IDs."""
+    await asyncio.sleep(5) # Wait for clients to fully start
+    try:
+        logger.info("Syncing Bot dialogs in background...")
+        async for _ in bot.get_dialogs():
+            pass
+        logger.info("Syncing User dialogs in background...")
+        async for _ in user.get_dialogs():
+            pass
+        logger.info("✅ Dialog sync complete! Bot knows all chats now.")
+    except Exception as e:
+        logger.error(f"Dialog sync failed: {e}")
+
 # --- Main Async Function ---
 async def main():
     if not SESSION_STRING:
@@ -37,7 +52,10 @@ async def main():
     logger.info("Starting User Client...")
     await user.start()
     
-    logger.info("🚀 Both clients started successfully in the same event loop. Bot is running!")
+    logger.info("🚀 Both clients started successfully. Bot is running!")
+    
+    # Start the background sync task
+    asyncio.create_task(sync_dialogs())
     
     # Keep the event loop alive for BOTH clients
     await idle()
