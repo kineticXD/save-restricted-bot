@@ -25,11 +25,17 @@ async def save_single(client: Client, message: Message):
     try:
         from main import user
         
-        source_msg = await user.get_messages(chat_id, msg_id)
-        if not source_msg:
-            await status_msg.edit_text("❌ Message not found or inaccessible.")
+        # 1. Try to fetch the message using the userbot
+        try:
+            source_msg = await user.get_messages(chat_id, msg_id)
+            if not source_msg or source_msg.empty:
+                await status_msg.edit_text("❌ Message not found. It might be a system message or deleted.")
+                return
+        except Exception as e:
+            await status_msg.edit_text(f"❌ **Userbot Fetch Error:**\n`{str(e)}`\n\n*(Is your userbot account a member of the source group?)*")
             return
 
+        # 2. Try to copy it to the target group
         await safe_execute(
             user.copy_message,
             chat_id=target_chat,
@@ -40,7 +46,7 @@ async def save_single(client: Client, message: Message):
         await status_msg.edit_text("✅ **Saved successfully.**")
 
     except Exception as e:
-        await status_msg.edit_text(f"❌ **Error:** `{str(e)}`")
+        await status_msg.edit_text(f"❌ **Copy Error:** `{str(e)}`\n\n*(Is the Bot an Admin in this group?)*")
 
 @Client.on_message(filters.command("batch") & filters.user(OWNER_ID))
 async def save_batch(client: Client, message: Message):
@@ -64,6 +70,7 @@ async def save_batch(client: Client, message: Message):
         from main import user
         success_count = 0
         semaphore = asyncio.Semaphore(1)
+        errors = [] # Store errors to show you later
 
         async def process_one(msg_id):
             async with semaphore:
@@ -78,14 +85,28 @@ async def save_batch(client: Client, message: Message):
                             message_thread_id=thread_id
                         )
                         return True
+                    else:
+                        errors.append(f"Msg {msg_id}: Empty/System")
                 except Exception as e:
-                    logger.error(f"Batch item {msg_id} failed: {e}")
+                    errors.append(f"Msg {msg_id}: {str(e)}")
                 return False
 
         tasks = [process_one(mid) for mid in range(start_id, end_id + 1)]
         results = await asyncio.gather(*tasks)
         success_count = sum(results)
 
-        await status_msg.edit_text(f"✅ **Batch complete.**\nSent {success_count} / {end_id - start_id + 1} posts.")
+        # Build the final report
+        report = f"✅ **Batch complete.**\nSent {success_count} / {end_id - start_id + 1} posts.\n"
+        
+        if errors:
+            report += "\n**Errors Encountered:**\n"
+            # Show first 3 errors only to keep the message clean
+            for err in errors[:3]: 
+                report += f"• `{err}`\n"
+            if len(errors) > 3:
+                report += f"• ...and {len(errors) - 3} more."
+                
+        await status_msg.edit_text(report)
+
     except Exception as e:
         await status_msg.edit_text(f"❌ **Batch error:** `{str(e)}`")
