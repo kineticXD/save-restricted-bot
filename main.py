@@ -25,36 +25,23 @@ def run_flask():
 bot = Client("SaveBot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN, plugins=dict(root="plugins"))
 user = Client("SaveUser", api_id=API_ID, api_hash=API_HASH, session_string=SESSION_STRING)
 
-# --- Background Dialog Syncing ---
-async def sync_dialogs():
-    """Runs in the background to cache chat IDs without blocking the bot."""
-    try:
-        logger.info("Syncing Userbot dialogs in background...")
-        async for _ in user.get_dialogs():
-            pass
-        logger.info("Syncing Bot dialogs in background...")
-        async for _ in bot.get_dialogs():
-            pass
-        logger.info("✅ Dialog sync complete. Peer IDs are cached.")
-    except Exception as e:
-        logger.error(f"Failed to sync dialogs: {e}")
-
 # --- Main Async Function ---
 async def main():
-    # 1. Start the bot FIRST so it can reply immediately
+    # Check if SESSION_STRING is valid before starting
+    if not SESSION_STRING:
+        logger.error("❌ CRITICAL ERROR: SESSION_STRING is missing in Railway Variables!")
+        logger.error("Please generate a new Pyrogram String and add it to your environment variables.")
+        return
+        
     logger.info("Starting Bot Client...")
     await bot.start()
     
-    # 2. Start the userbot
     logger.info("Starting User Client...")
     await user.start()
     
     logger.info("🚀 Both clients started successfully. Bot is running!")
     
-    # 3. Run the dialog sync in the background so it doesn't block replies
-    asyncio.create_task(sync_dialogs())
-    
-    # 4. Keep the event loop alive
+    # Keep the event loop alive
     await idle()
     
     logger.info("Stopping clients...")
