@@ -29,16 +29,20 @@ user = Client("SaveUser", api_id=API_ID, api_hash=API_HASH, session_string=SESSI
 async def main():
     logger.info("Starting User Client...")
     await user.start()
+    
     # Force Userbot to sync its dialogs (caches IDs)
     logger.info("Syncing Userbot dialogs...")
-    await user.get_dialogs()
-    
+    async for _ in user.get_dialogs():
+        pass # Looping through it forces Pyrogram to cache the chats
+        
     logger.info("Starting Bot Client...")
     await bot.start()
+    
     # Force Bot to sync its dialogs (caches IDs)
     logger.info("Syncing Bot dialogs...")
-    await bot.get_dialogs()
-    
+    async for _ in bot.get_dialogs():
+        pass
+        
     logger.info("🚀 Both clients started and synced successfully. Bot is running!")
     
     # This keeps the event loop running indefinitely for both clients
