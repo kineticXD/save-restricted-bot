@@ -6,13 +6,16 @@ from datetime import datetime, timedelta
 from pyrogram.errors import FloodWait, PeerIdInvalid, ChannelInvalid, ChannelPrivate
 from pyrogram.types import Message
 
+from storage import get_target
+
 logger = logging.getLogger(__name__)
 
-# --- SAFETY SETTINGS ---
+# --- TRANSFER SAFETY SETTINGS ---
 MIN_DELAY = 2.0
 MAX_DELAY = 5.0
 FLOOD_MULTIPLIER = 1.3
 MAX_FLOODS_PER_DAY = 3
+
 
 class SafetyGuard:
     def __init__(self):
@@ -33,23 +36,27 @@ class SafetyGuard:
 
     def check_circuit(self):
         if self.circuit_open:
-            if datetime.now() > self.circuit_until:
+            if self.circuit_until and datetime.now() > self.circuit_until:
                 self.circuit_open = False
                 self.flood_count = 0
+                self.circuit_until = None
                 logger.info("Circuit breaker RESET.")
             else:
                 return False
         return True
 
+
 guard = SafetyGuard()
+
 
 async def safe_delay():
     await asyncio.sleep(random.uniform(MIN_DELAY, MAX_DELAY))
 
+
 async def safe_execute(func, *args, **kwargs):
-    """Wraps API calls with FloodWait compliance and circuit breaker."""
+    """Wrap API calls with FloodWait compliance and a circuit breaker."""
     if not guard.check_circuit():
-        raise Exception("Safety circuit is open. Please wait.")
+        raise RuntimeError("Safety circuit is open. Please wait before sending again.")
 
     for attempt in range(2):
         try:
@@ -58,66 +65,79 @@ async def safe_execute(func, *args, **kwargs):
             return result
         except FloodWait as e:
             wait_time = e.value * FLOOD_MULTIPLIER
-            logger.warning(f"FloodWait: sleeping for {wait_time}s (attempt {attempt+1})")
+            logger.warning("FloodWait: sleeping for %ss (attempt %s)", wait_time, attempt + 1)
             await asyncio.sleep(wait_time)
             guard.record_flood()
-        except Exception as e:
-            logger.error(f"API Error: {e}")
-            raise e
-    raise Exception("FloodWait retry failed.")
+    raise RuntimeError("Telegram rate-limit retry failed. Try again later.")
+
 
 def extract_chat_and_msg_id(link: str):
-    """Parse a t.me link to get chat ID and message ID (handles Topic links)."""
-    # This regex handles: t.me/c/123456789/50 AND t.me/c/123456789/123/50
-    pattern = r'(?:https?://)?t\.me/(?:c/)?([^/]+)/(?:(\d+)/)?(\d+)'
-    
-    match = re.search(pattern, link)
-    if match:
-        chat_identifier = match.group(1)
-        msg_id = int(match.group(3)) # The last number is always the message ID
-        
-        if chat_identifier.isdigit():
-            chat_identifier = int(f"-100{chat_identifier}")
-            
-        return chat_identifier, msg_id
-    return None, None
+    """Parse common t.me links, including private, public and topic links."""
+    if not link:
+        return None, None
+    pattern = r"(?:https?://)?(?:www\.)?t\.me/(?:c/)?([^/?#]+)/(?:(\d+)/)?(\d+)"
+    match = re.search(pattern, link.strip())
+    if not match:
+        return None, None
 
-async def get_target_topic(message: Message):
-    """Determine the target chat and topic ID from the command message."""
-    thread_id = getattr(message, 'message_thread_id', None)
-    if thread_id == 1:
-        thread_id = None
-    return message.chat.id, thread_id
+    chat_identifier = match.group(1)
+    msg_id = int(match.group(3))
+    if chat_identifier.isdigit():
+        chat_identifier = int(f"-100{chat_identifier}")
+    elif chat_identifier.startswith("+"):
+        return None, None  # invite links do not identify an individual message
+    return chat_identifier, msg_id
+
+
+def _chat_kind(chat):
+    value = getattr(chat, "type", None)
+    return getattr(value, "value", str(value)).lower().split(".")[-1]
+
+
+def is_group_chat(chat) -> bool:
+    kind = _chat_kind(chat)
+    if kind in {"group", "supergroup"}:
+        return True
+    # Compatibility for test doubles and old Message objects with no .type.
+    return getattr(chat, "type", None) is None and int(getattr(chat, "id", 0) or 0) < 0
+
+
+async def get_destination(message: Message, owner_id: int):
+    """Use the current group when invoked there; otherwise the saved group."""
+    chat = getattr(message, "chat", None)
+    if chat and is_group_chat(chat):
+        thread_id = getattr(message, "message_thread_id", None)
+        return chat.id, (None if thread_id == 1 else thread_id)
+
+    saved = get_target(owner_id)
+    if not saved:
+        raise LookupError(
+            "No destination group is set yet. Add the bot to your group as a regular member, "
+            "then run /settarget@YourBotUsername in that group."
+        )
+    return saved["target_chat_id"], saved.get("target_thread_id")
 
 
 # --- PEER CACHE HELPERS ---
-# Railway wipes local state on every restart, so the userbot starts with an empty
-# peer cache. Instead of syncing every dialog at startup (slow, can hang), resolve
-# each chat lazily the first time it is needed.
+# Railway can restart with an empty peer cache. Resolve chats lazily.
 _resolved_peers = set()
 
 
 async def ensure_peer(client, chat_id, scan_limit: int = 300, timeout: int = 60) -> bool:
-    """Make sure `client` can resolve `chat_id`. Returns True on success.
-
-    1. Cheap path: get_chat() (cache hit, or ResolveUsername / GetChannels).
-    2. Fallback: scan the first `scan_limit` dialogs (bounded by `timeout`).
-       Every API response that carries users/chats populates the peer cache,
-       so one scan fills it.
-    """
-    if isinstance(chat_id, int) and chat_id in _resolved_peers:
+    """Ensure the client can resolve a chat, with a bounded dialog-scan fallback."""
+    cache_key = (id(client), chat_id)
+    if isinstance(chat_id, int) and cache_key in _resolved_peers:
         return True
-
     try:
         await client.get_chat(chat_id)
         if isinstance(chat_id, int):
-            _resolved_peers.add(chat_id)
+            _resolved_peers.add(cache_key)
         return True
     except (KeyError, ValueError, PeerIdInvalid, ChannelInvalid, ChannelPrivate):
         pass
 
     if not isinstance(chat_id, int):
-        return False  # usernames are resolved server-side; nothing more to try
+        return False
 
     async def _scan():
         async for dialog in client.get_dialogs(limit=scan_limit):
@@ -127,7 +147,7 @@ async def ensure_peer(client, chat_id, scan_limit: int = 300, timeout: int = 60)
 
     try:
         if await asyncio.wait_for(_scan(), timeout=timeout):
-            _resolved_peers.add(chat_id)
+            _resolved_peers.add(cache_key)
             return True
     except asyncio.TimeoutError:
         logger.warning("Dialog scan timed out while looking for %s", chat_id)
@@ -136,12 +156,17 @@ async def ensure_peer(client, chat_id, scan_limit: int = 300, timeout: int = 60)
     return False
 
 
-async def prepare_chats(user, source_chat, target_chat):
-    """Return None if both chats are usable by the userbot, else a user-facing error."""
-    if not await ensure_peer(user, source_chat):
-        return ("Userbot can't access the **source** chat. "
-                "Make sure your account has joined it.")
-    if not await ensure_peer(user, target_chat):
-        return ("Userbot can't access **this** chat. "
-                "Add your user account to this group first.")
+async def prepare_chats(reader, source_chat, target_chat, sender=None):
+    """Check source access for the reader and destination access for the sender."""
+    sender = sender or reader
+    if not await ensure_peer(reader, source_chat):
+        return (
+            "The signed-in source account can't access the source chat. "
+            "Join that source chat with the account used for SESSION_STRING."
+        )
+    if not await ensure_peer(sender, target_chat):
+        return (
+            "The bot account can't access the destination group. Add the bot to that group "
+            "as a regular member; administrator privileges are not required."
+        )
     return None
