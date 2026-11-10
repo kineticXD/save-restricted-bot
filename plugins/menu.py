@@ -30,7 +30,6 @@ async def menu_callback(client: Client, query: CallbackQuery):
             dashboard_text(OWNER_ID),
             reply_markup=dashboard_keyboard(),
             parse_mode=enums.ParseMode.HTML,
-            disable_web_page_preview=True,
         )
         return
 
