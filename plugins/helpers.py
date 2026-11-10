@@ -90,16 +90,46 @@ def extract_chat_and_msg_id(link: str):
 
 
 def _chat_kind(chat):
+    """Return a normalized chat type across Pyrogram/Kurigram enum variants."""
     value = getattr(chat, "type", None)
-    return getattr(value, "value", str(value)).lower().split(".")[-1]
+    candidates = (
+        getattr(value, "value", None),
+        getattr(value, "name", None),
+        value,
+    )
+    for candidate in candidates:
+        if candidate is None:
+            continue
+        kind = str(candidate).strip().lower()
+        if not kind:
+            continue
+        kind = kind.rsplit(".", 1)[-1]
+        kind = re.sub(r"[^a-z]", "", kind)
+        if kind in {"private", "bot", "group", "supergroup", "channel"}:
+            return kind
+    return ""
 
 
 def is_group_chat(chat) -> bool:
+    """Recognize basic groups and supergroups, including enum/version variants.
+
+    Telegram group chat IDs are negative. Use that as a fallback only when the
+    library returns an unknown/missing type; never mistake a known channel for
+    a group.
+    """
+    if chat is None:
+        return False
+
     kind = _chat_kind(chat)
     if kind in {"group", "supergroup"}:
         return True
-    # Compatibility for test doubles and old Message objects with no .type.
-    return getattr(chat, "type", None) is None and int(getattr(chat, "id", 0) or 0) < 0
+    if kind in {"private", "bot", "channel"}:
+        return False
+
+    try:
+        return int(getattr(chat, "id", 0) or 0) < 0
+    except (TypeError, ValueError):
+        return False
 
 
 async def get_destination(message: Message, owner_id: int):
