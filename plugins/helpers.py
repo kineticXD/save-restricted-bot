@@ -3,7 +3,7 @@ import random
 import asyncio
 import logging
 from datetime import datetime, timedelta
-from pyrogram.errors import FloodWait
+from pyrogram.errors import FloodWait, PeerIdInvalid, ChannelInvalid, ChannelPrivate
 from pyrogram.types import Message
 
 logger = logging.getLogger(__name__)
@@ -88,3 +88,60 @@ async def get_target_topic(message: Message):
     if thread_id == 1:
         thread_id = None
     return message.chat.id, thread_id
+
+
+# --- PEER CACHE HELPERS ---
+# Railway wipes local state on every restart, so the userbot starts with an empty
+# peer cache. Instead of syncing every dialog at startup (slow, can hang), resolve
+# each chat lazily the first time it is needed.
+_resolved_peers = set()
+
+
+async def ensure_peer(client, chat_id, scan_limit: int = 300, timeout: int = 60) -> bool:
+    """Make sure `client` can resolve `chat_id`. Returns True on success.
+
+    1. Cheap path: get_chat() (cache hit, or ResolveUsername / GetChannels).
+    2. Fallback: scan the first `scan_limit` dialogs (bounded by `timeout`).
+       Every API response that carries users/chats populates the peer cache,
+       so one scan fills it.
+    """
+    if isinstance(chat_id, int) and chat_id in _resolved_peers:
+        return True
+
+    try:
+        await client.get_chat(chat_id)
+        if isinstance(chat_id, int):
+            _resolved_peers.add(chat_id)
+        return True
+    except (KeyError, ValueError, PeerIdInvalid, ChannelInvalid, ChannelPrivate):
+        pass
+
+    if not isinstance(chat_id, int):
+        return False  # usernames are resolved server-side; nothing more to try
+
+    async def _scan():
+        async for dialog in client.get_dialogs(limit=scan_limit):
+            if dialog.chat.id == chat_id:
+                return True
+        return False
+
+    try:
+        if await asyncio.wait_for(_scan(), timeout=timeout):
+            _resolved_peers.add(chat_id)
+            return True
+    except asyncio.TimeoutError:
+        logger.warning("Dialog scan timed out while looking for %s", chat_id)
+    except FloodWait as e:
+        logger.warning("FloodWait %ss during dialog scan", e.value)
+    return False
+
+
+async def prepare_chats(user, source_chat, target_chat):
+    """Return None if both chats are usable by the userbot, else a user-facing error."""
+    if not await ensure_peer(user, source_chat):
+        return ("Userbot can't access the **source** chat. "
+                "Make sure your account has joined it.")
+    if not await ensure_peer(user, target_chat):
+        return ("Userbot can't access **this** chat. "
+                "Add your user account to this group first.")
+    return None
