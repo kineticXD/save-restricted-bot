@@ -190,9 +190,9 @@ async def _download_thumb(user, media, tmpdir: str) -> Optional[str]:
 # ----------------------------------------------------------------------------
 # re-upload
 # ----------------------------------------------------------------------------
-async def _send_text(user, msg, target_chat, thread_id):
+async def _send_text(sender, msg, target_chat, thread_id):
     await safe_execute(
-        user.send_message,
+        sender.send_message,
         chat_id=target_chat,
         text=msg.text,
         entities=getattr(msg, "entities", None),
@@ -202,7 +202,7 @@ async def _send_text(user, msg, target_chat, thread_id):
     )
 
 
-async def _send_simple_media(user, msg, media_type, target_chat, thread_id):
+async def _send_simple_media(sender, msg, media_type, target_chat, thread_id):
     """Contact / location / venue: nothing to download."""
     if media_type == enums.MessageMediaType.CONTACT:
         c = msg.contact
@@ -216,11 +216,11 @@ async def _send_simple_media(user, msg, media_type, target_chat, thread_id):
             kw["last_name"] = c.last_name
         if c.vcard:
             kw["vcard"] = c.vcard
-        await safe_execute(user.send_contact, **kw)
+        await safe_execute(sender.send_contact, **kw)
     elif media_type == enums.MessageMediaType.LOCATION:
         loc = msg.location
         await safe_execute(
-            user.send_location,
+            sender.send_location,
             chat_id=target_chat,
             latitude=loc.latitude,
             longitude=loc.longitude,
@@ -240,16 +240,16 @@ async def _send_simple_media(user, msg, media_type, target_chat, thread_id):
             kw["foursquare_id"] = v.foursquare_id
         if v.foursquare_type:
             kw["foursquare_type"] = v.foursquare_type
-        await safe_execute(user.send_venue, **kw)
+        await safe_execute(sender.send_venue, **kw)
 
 
-async def _reupload_file(user, msg, media_type, target_chat, thread_id, on_stage):
+async def _reupload_file(reader, sender, msg, media_type, target_chat, thread_id, on_stage):
     attr, sender_name, param, has_caption, has_thumb = _MEDIA_SPECS[media_type]
     media = getattr(msg, attr)
     size = int(getattr(media, "file_size", 0) or 0)
     kind = media_type.name.lower().replace("_", " ")
 
-    premium = await _is_premium(user)
+    premium = await _is_premium(sender)
 
     # ---- size / disk guards (fail early, before downloading anything) ----
     limit_mb = FILE_LIMIT_PREMIUM_MB if premium else FILE_LIMIT_FREE_MB
@@ -273,9 +273,9 @@ async def _reupload_file(user, msg, media_type, target_chat, thread_id, on_stage
         async with _transfer_lock:
             await _stage(on_stage, f"⬇️ Downloading {kind} ({_fmt_size(size)})...")
             path = await _download(
-                user, msg, dest, progress=_progress_cb(on_stage, f"⬇️ Downloading {kind}"), expected_size=size
+                reader, msg, dest, progress=_progress_cb(on_stage, f"⬇️ Downloading {kind}"), expected_size=size
             )
-            thumb_path = await _download_thumb(user, media, tmpdir) if has_thumb else None
+            thumb_path = await _download_thumb(reader, media, tmpdir) if has_thumb else None
 
             # ---- build send arguments ----
             kw = {"chat_id": target_chat, param: path, "message_thread_id": thread_id}
@@ -343,11 +343,11 @@ async def _reupload_file(user, msg, media_type, target_chat, thread_id, on_stage
                 kw["progress"] = progress
 
             await _stage(on_stage, f"⬆️ Uploading {kind} ({_fmt_size(size)})...")
-            await safe_execute(getattr(user, sender_name), **kw)
+            await safe_execute(getattr(sender, sender_name), **kw)
 
             if extra_caption_text:
                 await safe_execute(
-                    user.send_message,
+                    sender.send_message,
                     chat_id=target_chat,
                     text=extra_caption_text,
                     entities=getattr(msg, "caption_entities", None),
@@ -358,8 +358,12 @@ async def _reupload_file(user, msg, media_type, target_chat, thread_id, on_stage
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
-async def reupload(user, msg, target_chat, thread_id=None, on_stage: StageCallback = None):
-    """Re-create `msg` in `target_chat` by downloading and re-uploading its content."""
+async def reupload(user, msg, target_chat, thread_id=None, on_stage: StageCallback = None, sender=None):
+    """Re-create a message using `user` to read it and `sender` to post it.
+
+    `sender` defaults to `user` to preserve the original user-session behaviour.
+    """
+    sender = sender or user
     if getattr(msg, "empty", None) or getattr(msg, "service", None):
         raise UnsupportedMedia("Empty or service message.")
 
@@ -367,17 +371,17 @@ async def reupload(user, msg, target_chat, thread_id=None, on_stage: StageCallba
 
     # Plain text (also messages whose only "media" is a link preview)
     if getattr(msg, "text", None) and media_type in (None, enums.MessageMediaType.WEB_PAGE):
-        await _send_text(user, msg, target_chat, thread_id)
+        await _send_text(sender, msg, target_chat, thread_id)
         return
 
     if media_type in _MEDIA_SPECS:
-        await _reupload_file(user, msg, media_type, target_chat, thread_id, on_stage)
+        await _reupload_file(user, sender, msg, media_type, target_chat, thread_id, on_stage)
         return
 
     if media_type in (
         enums.MessageMediaType.CONTACT, enums.MessageMediaType.LOCATION, enums.MessageMediaType.VENUE
     ):
-        await _send_simple_media(user, msg, media_type, target_chat, thread_id)
+        await _send_simple_media(sender, msg, media_type, target_chat, thread_id)
         return
 
     name = media_type.name.lower().replace("_", " ") if media_type else "unknown"
@@ -388,13 +392,22 @@ async def reupload(user, msg, target_chat, thread_id=None, on_stage: StageCallba
 # public entry point
 # ----------------------------------------------------------------------------
 async def copy_or_reupload(
-    user, source_chat, source_msg, target_chat, thread_id=None, on_stage: StageCallback = None
+    user, source_chat, source_msg, target_chat, thread_id=None,
+    on_stage: StageCallback = None, sender=None,
 ) -> str:
+    """Copy/re-upload a source message to a destination.
+
+    `user` is the account that can read the source. `sender` is the account that
+    posts to the destination. When both clients differ (the normal bot setup),
+    the reader downloads the media and the bot account uploads it. Telegram
+    group permissions still apply to that bot account.
     """
-    Returns "copied" (server-side copy) or "reuploaded" (download + upload).
-    Raises UnsupportedMedia for message types that can't be copied at all.
-    """
-    if not (FORCE_REUPLOAD or is_protected(source_msg)):
+    sender = sender or user
+
+    # Server-side copy only works through one Telegram account that can access
+    # both chats. With separate reader/sender clients, use a controlled
+    # download-and-upload transfer so the destination post is authored by sender.
+    if sender is user and not (FORCE_REUPLOAD or is_protected(source_msg)):
         try:
             await safe_execute(
                 user.copy_message,
@@ -407,5 +420,5 @@ async def copy_or_reupload(
         except FALLBACK_ERRORS as e:
             logger.info("copy_message not possible (%s) - falling back to download/upload", type(e).__name__)
 
-    await reupload(user, source_msg, target_chat, thread_id, on_stage)
+    await reupload(user, source_msg, target_chat, thread_id, on_stage, sender=sender)
     return "reuploaded"
