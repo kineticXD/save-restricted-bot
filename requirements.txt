@@ -1,4 +1,4 @@
-pyrogram==2.0.106
+kurigram==2.2.27
 TgCrypto
 Flask
 python-dotenv
