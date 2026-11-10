@@ -302,7 +302,7 @@ async def main():
     client = NS(userbot=HUser({5: msg(T.VIDEO, protected=True, video=NS(file_size=70, width=1, height=1, duration=1, file_name="v.mp4", thumbs=None))}))
     c = Cmd(["https://t.me/c/3761240705/5"]); c.command[0] = "save"
     await S.save_single(client, c)
-    check("17 /save on protected chat -> 'Saved ... (re-uploaded)'", "Saved successfully" in c.status.texts[-1] and "re-uploaded" in c.status.texts[-1], c.status.texts)
+    check("17 /save handler completes an upload", "Uploaded successfully" in c.status.texts[-1], c.status.texts)
     msgs = {5: msg(T.PHOTO, photo=NS(file_size=50, thumbs=None)),
             6: msg(T.POLL, protected=True),
             7: msg(T.PHOTO, protected=True, photo=NS(file_size=50, thumbs=None))}
@@ -311,8 +311,17 @@ async def main():
     c = Cmd(["https://t.me/c/3761240705/5", "https://t.me/c/3761240705/7"]); c.command[0] = "batch"
     await S.save_batch(client, c)
     rep = c.status.texts[-1]
-    check("17b /batch mixed: 2 saved (1 re-uploaded), poll skipped with reason", "Sent 2 / 3" in rep and "1 re-uploaded" in rep and "skipped" in rep, rep)
+    check("17b /batch mixed: two uploaded and poll skipped with reason", "Uploaded: `2` / `3`" in rep and "skipped" in rep, rep)
     check("17c no temp files leaked by handlers", leftover_dirs() == [])
+
+    # 18 ----------------------------------------------------------- separate source-reader and destination-bot clients
+    reader, poster = FakeUser(), FakeUser()
+    dual_msg = msg(T.DOCUMENT, protected=True, document=NS(file_size=120, file_name="group.pdf", thumbs=None))
+    result = await copy_or_reupload(reader, SRC, dual_msg, TARGET, sender=poster)
+    check("18 dual-client delivery downloads with reader and uploads with poster",
+          result == "reuploaded" and bool(reader.downloads) and poster.methods() == ["send_document"] and not reader.methods(),
+          (reader.methods(), poster.methods()))
+    check("18b dual-client transfer cleans temp files", leftover_dirs() == [])
 
     print()
     print("ALL TESTS PASSED" if not FAILS else f"{len(FAILS)} FAILED: {FAILS}")
