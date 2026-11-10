@@ -25,10 +25,6 @@ async def save_single(client: Client, message: Message):
     try:
         from main import user
         
-        # Force the bot to recognize the group ID
-        await client.resolve_peer(target_chat)
-        await user.resolve_peer(target_chat)
-        
         source_msg = await user.get_messages(chat_id, msg_id)
         if not source_msg or source_msg.empty:
             await status_msg.edit_text("❌ Message not found. It might be a system message or deleted.")
@@ -66,11 +62,6 @@ async def save_batch(client: Client, message: Message):
 
     try:
         from main import user
-        
-        # Force the bot to recognize the group ID
-        await client.resolve_peer(target_chat)
-        await user.resolve_peer(target_chat)
-        
         success_count = 0
         semaphore = asyncio.Semaphore(1) 
         errors = []
