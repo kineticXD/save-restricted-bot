@@ -57,7 +57,6 @@ async def start_handler(client: Client, message: Message):
         dashboard_text(OWNER_ID),
         reply_markup=dashboard_keyboard(),
         parse_mode=enums.ParseMode.HTML,
-        disable_web_page_preview=True,
     )
 
 
