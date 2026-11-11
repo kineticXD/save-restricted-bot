@@ -1,8 +1,12 @@
+
 import re
 import random
 import asyncio
 import logging
+from dataclasses import dataclass
 from datetime import datetime, timedelta
+from urllib.parse import urlsplit, parse_qs, unquote
+
 from pyrogram.errors import FloodWait, PeerIdInvalid, ChannelInvalid, ChannelPrivate
 from pyrogram.types import Message
 
@@ -54,7 +58,7 @@ async def safe_delay():
 
 
 async def safe_execute(func, *args, **kwargs):
-    """Wrap API calls with FloodWait compliance and a circuit breaker."""
+    """Wrap Telegram API calls with FloodWait compliance and a circuit breaker."""
     if not guard.check_circuit():
         raise RuntimeError("Safety circuit is open. Please wait before sending again.")
 
@@ -71,26 +75,162 @@ async def safe_execute(func, *args, **kwargs):
     raise RuntimeError("Telegram rate-limit retry failed. Try again later.")
 
 
-def extract_chat_and_msg_id(link: str):
-    """Parse common t.me links, including private, public and topic links."""
-    if not link:
-        return None, None
-    pattern = r"(?:https?://)?(?:www\.)?t\.me/(?:c/)?([^/?#]+)/(?:(\d+)/)?(\d+)"
-    match = re.search(pattern, link.strip())
-    if not match:
-        return None, None
+@dataclass(frozen=True)
+class TelegramMessageRef:
+    chat_id: int | str
+    message_id: int
+    topic_id: int | None = None
 
-    chat_identifier = match.group(1)
-    msg_id = int(match.group(3))
-    if chat_identifier.isdigit():
-        chat_identifier = int(f"-100{chat_identifier}")
-    elif chat_identifier.startswith("+"):
-        return None, None  # invite links do not identify an individual message
-    return chat_identifier, msg_id
+
+def parse_telegram_message_link(link: str) -> TelegramMessageRef | None:
+    """Parse public/private Telegram message links, including forum-topic links.
+
+    Supported examples:
+      https://t.me/channel_name/123
+      https://t.me/channel_name/456/123       (topic 456, message 123)
+      https://t.me/c/123456789/123
+      https://t.me/c/123456789/456/123        (topic 456, message 123)
+      https://t.me/c/123456789/123?thread=456
+    """
+    if not link:
+        return None
+
+    candidate = str(link).strip().strip("<>[](){}.,;\"'")
+    if not candidate:
+        return None
+    if not re.match(r"^https?://", candidate, re.IGNORECASE):
+        candidate = "https://" + candidate
+
+    try:
+        parsed = urlsplit(candidate)
+    except ValueError:
+        return None
+
+    host = (parsed.hostname or "").lower()
+    if host not in {"t.me", "www.t.me", "telegram.me", "www.telegram.me", "telegram.dog", "www.telegram.dog"}:
+        return None
+
+    parts = [unquote(part) for part in parsed.path.split("/") if part]
+    if not parts:
+        return None
+
+    is_private_link = parts[0].lower() == "c"
+    if is_private_link:
+        if len(parts) < 3 or not parts[1].isdigit():
+            return None
+        internal_id = parts[1]
+        chat_id: int | str = int(f"-100{internal_id}")
+        tail = parts[2:]
+    else:
+        # The /s/ path is the public-preview form of a channel link.
+        if parts[0].lower() == "s":
+            parts = parts[1:]
+        if len(parts) < 2:
+            return None
+        username = parts[0].lstrip("@")
+        if not username or username.startswith("+") or username.lower() in {"joinchat", "addstickers"}:
+            return None
+        chat_id = username
+        tail = parts[1:]
+
+    if not tail or not tail[-1].isdigit():
+        return None
+
+    message_id = int(tail[-1])
+    if message_id <= 0:
+        return None
+
+    topic_id = None
+    query = parse_qs(parsed.query)
+
+    # Topic links normally have /<topic_id>/<message_id>; Telegram also
+    # occasionally shares a message URL with ?thread=<topic_id>.
+    if len(tail) >= 2 and tail[-2].isdigit():
+        topic_id = int(tail[-2])
+    for key in ("thread", "topic", "topic_id", "thread_id"):
+        values = query.get(key)
+        if values and str(values[0]).isdigit():
+            topic_id = int(values[0])
+            break
+
+    return TelegramMessageRef(chat_id=chat_id, message_id=message_id, topic_id=topic_id)
+
+
+def extract_chat_and_msg_id(link: str):
+    """Backward-compatible two-value parser used by older plugin code."""
+    parsed = parse_telegram_message_link(link)
+    if not parsed:
+        return None, None
+    return parsed.chat_id, parsed.message_id
+
+
+def get_message_topic_id(message) -> int | None:
+    """Return the Telegram forum topic root ID for a message when available."""
+    if message is None:
+        return None
+
+    for attribute in ("message_thread_id", "reply_to_top_message_id", "topic_id", "top_msg_id"):
+        value = getattr(message, attribute, None)
+        try:
+            if value is not None and int(value) > 0:
+                return int(value)
+        except (TypeError, ValueError):
+            continue
+
+    # Some client versions expose the MTProto reply header instead of the
+    # flattened reply_to_top_message_id convenience property.
+    reply_header = getattr(message, "reply_to", None)
+    if reply_header is not None:
+        for attribute in ("reply_to_top_id", "top_msg_id", "reply_to_top_message_id"):
+            value = getattr(reply_header, attribute, None)
+            try:
+                if value is not None and int(value) > 0:
+                    return int(value)
+            except (TypeError, ValueError):
+                continue
+
+    topic = getattr(message, "topic", None)
+    topic_id = getattr(topic, "id", None) if topic else None
+    try:
+        if topic_id is not None and int(topic_id) > 0:
+            return int(topic_id)
+    except (TypeError, ValueError):
+        pass
+
+    # The topic creation service message is itself the topic root.
+    if getattr(message, "forum_topic_created", None) is not None:
+        try:
+            return int(message.id)
+        except (TypeError, ValueError, AttributeError):
+            pass
+
+    # Do not infer General merely from is_topic_message: that boolean is true
+    # for named topics too. The caller may classify marker-free messages as
+    # General, but named topics must always match an actual root/thread ID.
+    return None
+
+
+def message_belongs_to_topic(message, topic_id: int | None) -> bool:
+    """Fail closed for named topics so messages from adjacent topics never leak in."""
+    if topic_id is None:
+        return True
+
+    try:
+        if int(getattr(message, "id", 0) or 0) == int(topic_id):
+            return True  # topic-root service message
+    except (TypeError, ValueError):
+        pass
+
+    actual_topic = get_message_topic_id(message)
+    if actual_topic is not None:
+        return int(actual_topic) == int(topic_id)
+
+    # Telegram's General topic is topic ID 1. In a forum, messages without a
+    # top-message marker are General-topic messages; named topics have a root ID.
+    return int(topic_id) == 1
 
 
 def _chat_kind(chat):
-    """Return a normalized chat type across Pyrogram/Kurigram enum variants."""
     value = getattr(chat, "type", None)
     candidates = (
         getattr(value, "value", None),
@@ -100,40 +240,29 @@ def _chat_kind(chat):
     for candidate in candidates:
         if candidate is None:
             continue
-        kind = str(candidate).strip().lower()
-        if not kind:
-            continue
-        kind = kind.rsplit(".", 1)[-1]
-        kind = re.sub(r"[^a-z]", "", kind)
-        if kind in {"private", "bot", "group", "supergroup", "channel"}:
-            return kind
-    return ""
+        text = str(candidate).lower().split(".")[-1]
+        text = re.sub(r"[^a-z]", "", text)
+        if "supergroup" in text:
+            return "supergroup"
+        if text == "group" or text.endswith("group"):
+            return "group"
+        if "channel" in text:
+            return "channel"
+        if "private" in text:
+            return "private"
+    return "unknown"
 
 
 def is_group_chat(chat) -> bool:
-    """Recognize basic groups and supergroups, including enum/version variants.
-
-    Telegram group chat IDs are negative. Use that as a fallback only when the
-    library returns an unknown/missing type; never mistake a known channel for
-    a group.
-    """
-    if chat is None:
-        return False
-
     kind = _chat_kind(chat)
     if kind in {"group", "supergroup"}:
         return True
-    if kind in {"private", "bot", "channel"}:
-        return False
-
-    try:
-        return int(getattr(chat, "id", 0) or 0) < 0
-    except (TypeError, ValueError):
-        return False
+    # Compatibility for test doubles and old Message objects with no .type.
+    return getattr(chat, "type", None) is None and int(getattr(chat, "id", 0) or 0) < 0
 
 
 async def get_destination(message: Message, owner_id: int):
-    """Use the current group when invoked there; otherwise the saved group."""
+    """Use the current group when invoked there; otherwise use the saved group."""
     chat = getattr(message, "chat", None)
     if chat and is_group_chat(chat):
         thread_id = getattr(message, "message_thread_id", None)
