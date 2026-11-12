@@ -44,6 +44,56 @@ FALLBACK_ERRORS = tuple(
     ) if isinstance(error, type)
 )
 
+
+def _is_file_reference_error(exc: Exception) -> bool:
+    """Handle FILE_REFERENCE_* errors even when a client build lacks a class mapping."""
+    name = type(exc).__name__.replace("_", "").lower()
+    text = str(exc).upper()
+    return (
+        "filereference" in name
+        or "FILE_REFERENCE_EXPIRED" in text
+        or "FILE_REFERENCE_EMPTY" in text
+        or "FILE_REFERENCE_INVALID" in text
+    )
+
+
+def _is_copy_fallback_error(exc: Exception) -> bool:
+    if FALLBACK_ERRORS and isinstance(exc, FALLBACK_ERRORS):
+        return True
+    name = type(exc).__name__.lower()
+    text = str(exc).upper()
+    return (
+        _is_file_reference_error(exc)
+        or "chatforwardsrestricted" in name
+        or "CHAT_FORWARDS_RESTRICTED" in text
+        or "MEDIA_EMPTY" in text
+        or "MEDIA_INVALID" in text
+    )
+
+
+async def _refresh_source_message(reader, source_chat, message_id):
+    """Fetch a message again so Telegram supplies a current media file_reference."""
+    if source_chat is None or message_id is None:
+        return None
+    try:
+        refreshed = await reader.get_messages(source_chat, int(message_id))
+    except TypeError:
+        try:
+            refreshed = await reader.get_messages(source_chat, message_ids=[int(message_id)])
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Could not refresh source message %s: %s", message_id, exc)
+            return None
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Could not refresh source message %s: %s", message_id, exc)
+        return None
+
+    if isinstance(refreshed, (list, tuple)):
+        refreshed = refreshed[0] if refreshed else None
+    if refreshed is None or getattr(refreshed, "empty", False):
+        return None
+    return refreshed
+
+
 # Keep only one large transfer active at a time to protect Railway disk/RAM.
 _transfer_lock = asyncio.Lock()
 _premium_cache: dict[int, bool] = {}
@@ -96,7 +146,10 @@ def _safe_local_name(name, max_bytes: int = 120) -> str:
 
 
 def _pick_thumb(media):
-    thumbs = [t for t in (getattr(media, "thumbs", None) or []) if getattr(t, "file_id", None)]
+    thumbs = [
+        t for t in (getattr(media, "thumbs", None) or [])
+        if getattr(t, "file_id", None)
+    ]
     if not thumbs:
         return None
     small = [t for t in thumbs if (getattr(t, "width", 0) or 0) <= 320]
@@ -148,6 +201,7 @@ def _progress_cb(on_stage: StageCallback, label: str, interval: float = 2.5):
         percent = min(100, int(current * 100 / total))
         now = time.monotonic()
         finished = current >= total
+
         if not finished and percent == state["pct"] and now - state["last"] < interval:
             return
         if not finished and now - state["last"] < interval:
@@ -157,10 +211,12 @@ def _progress_cb(on_stage: StageCallback, label: str, interval: float = 2.5):
             now = time.monotonic()
             if not finished and now - state["last"] < interval:
                 return
+
             filled = max(0, min(10, percent // 10))
             bar = "█" * filled + "░" * (10 - filled)
             state["last"] = now
             state["pct"] = percent
+
             await _stage(
                 on_stage,
                 f"{label}\n[{bar}] {percent}%\n{_fmt_size(current)} / {_fmt_size(total)}",
@@ -174,7 +230,8 @@ def _supports_parameter(func, name: str) -> bool:
     try:
         signature = inspect.signature(func)
         return name in signature.parameters or any(
-            p.kind == inspect.Parameter.VAR_KEYWORD for p in signature.parameters.values()
+            p.kind == inspect.Parameter.VAR_KEYWORD
+            for p in signature.parameters.values()
         )
     except (TypeError, ValueError):
         # Kurigram's public upload methods support progress; use it if the
@@ -184,24 +241,68 @@ def _supports_parameter(func, name: str) -> bool:
 
 def _optional_kwargs(func, values: dict) -> dict:
     """Keep optional media metadata compatible with the installed client build."""
-    return {key: value for key, value in values.items() if _supports_parameter(func, key)}
+    return {
+        key: value
+        for key, value in values.items()
+        if _supports_parameter(func, key)
+    }
 
 
-async def _download(reader, target, dest: str, progress=None, expected_size: int = 0) -> str:
-    """Download with a bounded FloodWait retry and a non-empty-file check."""
+async def _download(
+    reader,
+    target,
+    dest: str,
+    progress=None,
+    expected_size: int = 0,
+    source_chat=None,
+    source_message_id=None,
+) -> str:
+    """Download media, refreshing its source message once on FILE_REFERENCE_EXPIRED."""
+    candidate = target
     path = None
-    for attempt in range(2):
+    flood_retries = 0
+    refreshed_once = False
+
+    while True:
         try:
-            path = await reader.download_media(target, file_name=dest, progress=progress)
+            path = await reader.download_media(
+                candidate,
+                file_name=dest,
+                progress=progress,
+            )
             break
+
         except FloodWait as exc:
-            if attempt == 1 or exc.value > 300:
+            if flood_retries >= 2 or exc.value > 300:
                 raise
-            logger.warning("FloodWait %ss during download", exc.value)
+            flood_retries += 1
+            logger.warning(
+                "FloodWait %ss during download; retry %s",
+                exc.value,
+                flood_retries,
+            )
             await asyncio.sleep(exc.value + 1)
+
+        except Exception as exc:  # noqa: BLE001
+            if not refreshed_once and _is_file_reference_error(exc):
+                refreshed_once = True
+                refreshed = await _refresh_source_message(
+                    reader,
+                    source_chat,
+                    source_message_id or getattr(target, "id", None),
+                )
+                if refreshed is not None:
+                    logger.info(
+                        "Refreshed source message %s after expired file reference",
+                        getattr(refreshed, "id", source_message_id),
+                    )
+                    candidate = refreshed
+                    continue
+            raise
 
     if isinstance(path, list):
         path = path[0] if path else None
+
     if not path or not isinstance(path, (str, os.PathLike)) or not os.path.isfile(path):
         raise RuntimeError("Download failed: Telegram did not produce a local file.")
 
@@ -209,12 +310,11 @@ async def _download(reader, target, dest: str, progress=None, expected_size: int
     if size <= 0:
         raise RuntimeError("Download failed: the downloaded file is empty.")
 
-    # Keep exact size validation: uploading a truncated video/document is worse
-    # than failing that item with a clear error.
     if expected_size and size != expected_size:
         raise RuntimeError(
             f"Download incomplete: got {_fmt_size(size)}, expected {_fmt_size(expected_size)}."
         )
+
     return str(path)
 
 
@@ -222,8 +322,13 @@ async def _download_thumb(reader, media, tmpdir: str) -> Optional[str]:
     thumb = _pick_thumb(media)
     if thumb is None:
         return None
+
     try:
-        path = await _download(reader, thumb, os.path.join(tmpdir, "thumb.jpg"))
+        path = await _download(
+            reader,
+            thumb,
+            os.path.join(tmpdir, "thumb.jpg")
+        )
         if os.path.getsize(path) > THUMB_MAX_BYTES:
             return None
         return path
@@ -235,7 +340,10 @@ async def _download_thumb(reader, media, tmpdir: str) -> Optional[str]:
 async def _send_text(sender, msg, target_chat, thread_id):
     link_options = None
     if hasattr(types, "LinkPreviewOptions"):
-        link_options = types.LinkPreviewOptions(is_disabled=not bool(getattr(msg, "web_page", None)))
+        link_options = types.LinkPreviewOptions(
+            is_disabled=not bool(getattr(msg, "web_page", None))
+        )
+
     kwargs = {
         "chat_id": target_chat,
         "text": msg.text,
@@ -243,8 +351,10 @@ async def _send_text(sender, msg, target_chat, thread_id):
         "parse_mode": enums.ParseMode.DISABLED,
         "message_thread_id": thread_id,
     }
+
     if link_options is not None:
         kwargs["link_preview_options"] = link_options
+
     await safe_execute(sender.send_message, **kwargs)
 
 
@@ -257,10 +367,12 @@ async def _send_simple_media(sender, msg, media_type, target_chat, thread_id):
             "first_name": contact.first_name or contact.phone_number,
             "message_thread_id": thread_id,
         }
+
         if contact.last_name:
             kwargs["last_name"] = contact.last_name
         if contact.vcard:
             kwargs["vcard"] = contact.vcard
+
         await safe_execute(sender.send_contact, **kwargs)
         return
 
@@ -272,10 +384,17 @@ async def _send_simple_media(sender, msg, media_type, target_chat, thread_id):
             "longitude": loc.longitude,
             "message_thread_id": thread_id,
         }
-        for name in ("horizontal_accuracy", "live_period", "heading", "proximity_alert_radius"):
+
+        for name in (
+            "horizontal_accuracy",
+            "live_period",
+            "heading",
+            "proximity_alert_radius",
+        ):
             value = getattr(loc, name, None)
             if value is not None and _supports_parameter(sender.send_location, name):
                 kwargs[name] = value
+
         await safe_execute(sender.send_location, **kwargs)
         return
 
@@ -288,10 +407,12 @@ async def _send_simple_media(sender, msg, media_type, target_chat, thread_id):
         "address": venue.address,
         "message_thread_id": thread_id,
     }
+
     if getattr(venue, "foursquare_id", None):
         kwargs["foursquare_id"] = venue.foursquare_id
     if getattr(venue, "foursquare_type", None):
         kwargs["foursquare_type"] = venue.foursquare_type
+
     await safe_execute(sender.send_venue, **kwargs)
 
 
@@ -329,6 +450,7 @@ async def _send_poll(sender, msg, target_chat, thread_id):
         "allows_multiple_answers": getattr(poll, "allows_multiple_answers", False),
         "message_thread_id": thread_id,
     }
+
     if poll_kind is not None:
         kwargs["type"] = poll_kind
 
@@ -336,7 +458,9 @@ async def _send_poll(sender, msg, target_chat, thread_id):
     if correct_ids is None:
         single_correct = getattr(poll, "correct_option_id", None)
         correct_ids = [single_correct] if single_correct is not None else None
+
     is_quiz = "quiz" in str(getattr(poll_kind, "value", poll_kind)).lower()
+
     if correct_ids and is_quiz:
         kwargs["correct_option_ids"] = list(correct_ids)
     elif is_quiz:
@@ -345,6 +469,7 @@ async def _send_poll(sender, msg, target_chat, thread_id):
         regular_type = getattr(getattr(enums, "PollType", None), "REGULAR", None)
         if regular_type is not None:
             kwargs["type"] = regular_type
+
         description = _plain_text(getattr(poll, "description", None)).strip()
         notice = "Original quiz answer key is hidden; recreated as a regular poll."
         kwargs["description"] = (description + "\n\n" + notice).strip()[:1024]
@@ -366,6 +491,7 @@ async def _send_poll(sender, msg, target_chat, thread_id):
         "members_only",
         "country_codes",
     )
+
     for name in optional_poll_fields:
         value = getattr(poll, name, None)
         if value is not None and _supports_parameter(sender.send_poll, name):
@@ -376,6 +502,7 @@ async def _send_poll(sender, msg, target_chat, thread_id):
     if not bool(getattr(poll, "is_closed", False)):
         open_period = getattr(poll, "open_period", None)
         close_date = getattr(poll, "close_date", None)
+
         if open_period and _supports_parameter(sender.send_poll, "open_period"):
             kwargs["open_period"] = open_period
         elif close_date and _supports_parameter(sender.send_poll, "close_date"):
@@ -396,6 +523,7 @@ async def _send_poll(sender, msg, target_chat, thread_id):
 async def _send_dice(sender, msg, target_chat, thread_id):
     dice = getattr(msg, "dice", None)
     emoji = getattr(dice, "emoji", None) or "🎲"
+
     await safe_execute(
         sender.send_dice,
         chat_id=target_chat,
@@ -404,7 +532,16 @@ async def _send_dice(sender, msg, target_chat, thread_id):
     )
 
 
-async def _reupload_file(reader, sender, msg, media_type, target_chat, thread_id, on_stage):
+async def _reupload_file(
+    reader,
+    sender,
+    msg,
+    media_type,
+    target_chat,
+    thread_id,
+    on_stage,
+    source_chat=None,
+):
     attr, sender_name, param, has_caption, has_thumb = _MEDIA_SPECS[media_type]
     media = getattr(msg, attr)
     size = int(getattr(media, "file_size", 0) or 0)
@@ -414,10 +551,12 @@ async def _reupload_file(reader, sender, msg, media_type, target_chat, thread_id
     limit_mb = FILE_LIMIT_PREMIUM_MB if premium else FILE_LIMIT_FREE_MB
     if MAX_FILE_MB:
         limit_mb = min(limit_mb, MAX_FILE_MB)
+
     if size and size > limit_mb * MB:
         raise UnsupportedMedia(f"{kind} is {_fmt_size(size)}; limit is {limit_mb} MB.")
 
     tmpdir = tempfile.mkdtemp(prefix="save_")
+
     try:
         free = shutil.disk_usage(tmpdir).free
         if size and free < size * 1.05 + 50 * MB:
@@ -431,16 +570,28 @@ async def _reupload_file(reader, sender, msg, media_type, target_chat, thread_id
 
         async with _transfer_lock:
             await _stage(on_stage, f"⬇️ Downloading {kind} ({_fmt_size(size)})...")
+
             path = await _download(
-                reader, msg, dest,
+                reader,
+                msg,
+                dest,
                 progress=_progress_cb(on_stage, f"⬇️ Downloading {kind}"),
                 expected_size=size,
+                source_chat=source_chat,
+                source_message_id=getattr(msg, "id", None),
             )
+
             thumb_path = await _download_thumb(reader, media, tmpdir) if has_thumb else None
 
-            kwargs = {"chat_id": target_chat, param: path, "message_thread_id": thread_id}
+            kwargs = {
+                "chat_id": target_chat,
+                param: path,
+                "message_thread_id": thread_id,
+            }
+
             caption = getattr(msg, "caption", None) or None
             long_caption = None
+
             if has_caption and caption:
                 caption_limit = CAPTION_LIMIT_PREMIUM if premium else CAPTION_LIMIT_FREE
                 if len(caption) <= caption_limit:
@@ -453,14 +604,20 @@ async def _reupload_file(reader, sender, msg, media_type, target_chat, thread_id
                     long_caption = caption
 
             sender_method = getattr(sender, sender_name)
+
             if has_caption and getattr(msg, "has_media_spoiler", None) and media_type in (
-                enums.MessageMediaType.PHOTO, enums.MessageMediaType.VIDEO, enums.MessageMediaType.ANIMATION
+                enums.MessageMediaType.PHOTO,
+                enums.MessageMediaType.VIDEO,
+                enums.MessageMediaType.ANIMATION,
             ) and _supports_parameter(sender_method, "has_spoiler"):
                 kwargs["has_spoiler"] = True
+
             if has_caption and caption and long_caption is None and getattr(
                 msg, "show_caption_above_media", None
             ) and media_type in (
-                enums.MessageMediaType.PHOTO, enums.MessageMediaType.VIDEO, enums.MessageMediaType.ANIMATION
+                enums.MessageMediaType.PHOTO,
+                enums.MessageMediaType.VIDEO,
+                enums.MessageMediaType.ANIMATION,
             ) and _supports_parameter(sender_method, "show_caption_above_media"):
                 kwargs["show_caption_above_media"] = True
 
@@ -476,6 +633,7 @@ async def _reupload_file(reader, sender, msg, media_type, target_chat, thread_id
                 )
                 if original_name:
                     kwargs["file_name"] = original_name
+
             elif media_type == enums.MessageMediaType.ANIMATION:
                 kwargs.update(
                     duration=getattr(media, "duration", 0) or 0,
@@ -484,10 +642,12 @@ async def _reupload_file(reader, sender, msg, media_type, target_chat, thread_id
                 )
                 if original_name:
                     kwargs["file_name"] = original_name
+
             elif media_type == enums.MessageMediaType.DOCUMENT:
                 kwargs["force_document"] = True
                 if original_name:
                     kwargs["file_name"] = original_name
+
             elif media_type == enums.MessageMediaType.AUDIO:
                 kwargs["duration"] = getattr(media, "duration", 0) or 0
                 if getattr(media, "performer", None):
@@ -496,15 +656,18 @@ async def _reupload_file(reader, sender, msg, media_type, target_chat, thread_id
                     kwargs["title"] = media.title
                 if original_name:
                     kwargs["file_name"] = original_name
+
             elif media_type == enums.MessageMediaType.VOICE:
                 kwargs["duration"] = getattr(media, "duration", 0) or 0
                 if getattr(media, "waveform", None):
                     kwargs["waveform"] = media.waveform
+
             elif media_type == enums.MessageMediaType.VIDEO_NOTE:
                 kwargs.update(
                     duration=getattr(media, "duration", 0) or 0,
                     length=getattr(media, "length", 0) or 240,
                 )
+
             elif media_type == enums.MessageMediaType.STICKER:
                 if getattr(media, "emoji", None):
                     kwargs["emoji"] = media.emoji
@@ -525,6 +688,7 @@ async def _reupload_file(reader, sender, msg, media_type, target_chat, thread_id
                     parse_mode=enums.ParseMode.DISABLED,
                     message_thread_id=thread_id,
                 )
+
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
@@ -537,12 +701,15 @@ _ALBUM_INPUT_TYPES = {
 }
 
 
-async def reupload_media_group(reader, sender, messages, target_chat, thread_id=None, on_stage=None) -> bool:
+async def reupload_media_group(
+    reader, sender, messages, target_chat, thread_id=None, on_stage=None, source_chat=None
+) -> bool:
     """Re-upload a Telegram album as an album. Returns False if it is not supported."""
     ordered = sorted(
         (m for m in (messages or []) if m and not getattr(m, "empty", False)),
         key=lambda item: int(getattr(item, "id", 0) or 0),
     )
+
     if not 2 <= len(ordered) <= 10:
         return False
 
@@ -555,6 +722,7 @@ async def reupload_media_group(reader, sender, messages, target_chat, thread_id=
     # homogeneous.
     if any(not hasattr(types, _ALBUM_INPUT_TYPES[mt][1]) for mt in set(media_types)):
         return False
+
     names = {_ALBUM_INPUT_TYPES[mt][0] for mt in media_types}
     if ("audio" in names or "document" in names) and len(names) != 1:
         return False
@@ -563,19 +731,23 @@ async def reupload_media_group(reader, sender, messages, target_chat, thread_id=
     max_size = (FILE_LIMIT_PREMIUM_MB if premium else FILE_LIMIT_FREE_MB) * MB
     if MAX_FILE_MB:
         max_size = min(max_size, MAX_FILE_MB * MB)
+
     item_sizes = [
         int(getattr(getattr(m, _ALBUM_INPUT_TYPES[m.media][0]), "file_size", 0) or 0)
         for m in ordered
     ]
+
     too_large = max(item_sizes, default=0)
     if too_large > max_size:
         raise UnsupportedMedia(
             f"An album item is {_fmt_size(too_large)}; per-file limit is {_fmt_size(max_size)}."
         )
+
     total_size = sum(item_sizes)
 
     tmpdir = tempfile.mkdtemp(prefix="save_album_")
     long_captions = []
+
     try:
         free = shutil.disk_usage(tmpdir).free
         if total_size and free < total_size * 1.05 + 50 * MB:
@@ -584,6 +756,7 @@ async def reupload_media_group(reader, sender, messages, target_chat, thread_id=
             )
 
         input_media = []
+
         async with _transfer_lock:
             for index, item in enumerate(ordered, start=1):
                 attr, class_name = _ALBUM_INPUT_TYPES[item.media]
@@ -591,14 +764,27 @@ async def reupload_media_group(reader, sender, messages, target_chat, thread_id=
                 size = int(getattr(media, "file_size", 0) or 0)
                 filename = _safe_local_name(getattr(media, "file_name", None))
                 dest = os.path.join(tmpdir, f"{index}_{filename}") if filename else tmpdir + os.sep
-                await _stage(on_stage, f"⬇️ Downloading album item {index}/{len(ordered)} ({_fmt_size(size)})...")
-                path = await _download(
-                    reader, item, dest,
-                    progress=_progress_cb(on_stage, f"⬇️ Album item {index}/{len(ordered)}"),
-                    expected_size=size,
+
+                await _stage(
+                    on_stage,
+                    f"⬇️ Downloading album item {index}/{len(ordered)} ({_fmt_size(size)})..."
                 )
 
-                kwargs = {"media": path, "parse_mode": enums.ParseMode.DISABLED}
+                path = await _download(
+                    reader,
+                    item,
+                    dest,
+                    progress=_progress_cb(on_stage, f"⬇️ Album item {index}/{len(ordered)}"),
+                    expected_size=size,
+                    source_chat=source_chat,
+                    source_message_id=getattr(item, "id", None),
+                )
+
+                kwargs = {
+                    "media": path,
+                    "parse_mode": enums.ParseMode.DISABLED,
+                }
+
                 caption = getattr(item, "caption", None) or None
                 if caption:
                     caption_limit = CAPTION_LIMIT_PREMIUM if premium else CAPTION_LIMIT_FREE
@@ -606,7 +792,9 @@ async def reupload_media_group(reader, sender, messages, target_chat, thread_id=
                         kwargs["caption"] = caption
                         kwargs["caption_entities"] = getattr(item, "caption_entities", None)
                     else:
-                        long_captions.append((caption, getattr(item, "caption_entities", None)))
+                        long_captions.append(
+                            (caption, getattr(item, "caption_entities", None))
+                        )
 
                 if item.media == enums.MessageMediaType.VIDEO:
                     kwargs.update(
@@ -621,24 +809,33 @@ async def reupload_media_group(reader, sender, messages, target_chat, thread_id=
                         kwargs["has_spoiler"] = True
                     if getattr(item, "show_caption_above_media", None):
                         kwargs["show_caption_above_media"] = True
+
                 elif item.media == enums.MessageMediaType.PHOTO:
                     if getattr(item, "has_media_spoiler", None):
                         kwargs["has_spoiler"] = True
                     if getattr(item, "show_caption_above_media", None):
                         kwargs["show_caption_above_media"] = True
+
                 elif item.media == enums.MessageMediaType.AUDIO:
                     kwargs.update(
                         duration=getattr(media, "duration", 0) or 0,
                         title=getattr(media, "title", None),
                         performer=getattr(media, "performer", None),
                     )
+
                 elif item.media == enums.MessageMediaType.DOCUMENT:
-                    kwargs["file_name"] = getattr(media, "file_name", None) or os.path.basename(path)
+                    kwargs["file_name"] = (
+                        getattr(media, "file_name", None) or os.path.basename(path)
+                    )
 
                 input_cls = getattr(types, class_name)
                 input_media.append(input_cls(**kwargs))
 
-            await _stage(on_stage, f"⬆️ Uploading album ({len(input_media)} items)...")
+            await _stage(
+                on_stage,
+                f"⬆️ Uploading album ({len(input_media)} items)..."
+            )
+
             await safe_execute(
                 sender.send_media_group,
                 chat_id=target_chat,
@@ -655,25 +852,43 @@ async def reupload_media_group(reader, sender, messages, target_chat, thread_id=
                     parse_mode=enums.ParseMode.DISABLED,
                     message_thread_id=thread_id,
                 )
+
         return True
+
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
-async def reupload(reader, msg, target_chat, thread_id=None, on_stage: StageCallback = None, sender=None):
+async def reupload(
+    reader, msg, target_chat, thread_id=None, on_stage: StageCallback = None,
+    sender=None, source_chat=None,
+):
     """Re-create a message using reader to download and sender to post."""
     sender = sender or reader
+
     if getattr(msg, "empty", None) or getattr(msg, "service", None):
         raise UnsupportedMedia("Empty or Telegram service message.")
 
     media_type = getattr(msg, "media", None)
 
-    if getattr(msg, "text", None) and media_type in (None, getattr(enums.MessageMediaType, "WEB_PAGE", None)):
+    if getattr(msg, "text", None) and media_type in (
+        None,
+        getattr(enums.MessageMediaType, "WEB_PAGE", None),
+    ):
         await _send_text(sender, msg, target_chat, thread_id)
         return
 
     if media_type in _MEDIA_SPECS:
-        await _reupload_file(reader, sender, msg, media_type, target_chat, thread_id, on_stage)
+        await _reupload_file(
+            reader,
+            sender,
+            msg,
+            media_type,
+            target_chat,
+            thread_id,
+            on_stage,
+            source_chat=source_chat,
+        )
         return
 
     simple_types = {
@@ -681,6 +896,7 @@ async def reupload(reader, msg, target_chat, thread_id=None, on_stage: StageCall
         getattr(enums.MessageMediaType, "LOCATION", None),
         getattr(enums.MessageMediaType, "VENUE", None),
     }
+
     if media_type in simple_types:
         await _send_simple_media(sender, msg, media_type, target_chat, thread_id)
         return
@@ -695,6 +911,7 @@ async def reupload(reader, msg, target_chat, thread_id=None, on_stage: StageCall
 
     name = getattr(media_type, "name", str(media_type) if media_type else "unknown")
     name = str(name).lower().replace("_", " ")
+
     explanations = {
         "game": "Interactive Telegram games require their original game bot and cannot be recreated as a normal upload.",
         "invoice": "Payment invoices cannot be copied as normal media; the original payment provider setup is required.",
@@ -702,15 +919,22 @@ async def reupload(reader, msg, target_chat, thread_id=None, on_stage: StageCall
         "story": "Stories are not regular chat messages and cannot be imported with this message-link command.",
         "giveaway": "Telegram giveaway service posts cannot be recreated as ordinary media.",
     }
-    raise UnsupportedMedia(explanations.get(name, f"Telegram message type '{name}' cannot be re-created by the available send API."))
+
+    raise UnsupportedMedia(
+        explanations.get(
+            name,
+            f"Telegram message type '{name}' cannot be re-created by the available send API."
+        )
+    )
 
 
 async def copy_or_reupload(
     reader, source_chat, source_msg, target_chat, thread_id=None,
     on_stage: StageCallback = None, sender=None,
 ) -> str:
-    """Copy a message if one client can access both chats; otherwise re-upload it."""
+    """Copy when possible; refresh stale source references and re-upload on fallback."""
     sender = sender or reader
+    current_msg = source_msg
 
     if sender is reader and not (FORCE_REUPLOAD or is_protected(source_msg)):
         try:
@@ -722,11 +946,57 @@ async def copy_or_reupload(
                 message_thread_id=thread_id,
             )
             return "copied"
-        except FALLBACK_ERRORS as exc:
+
+        except Exception as exc:  # noqa: BLE001
+            if not _is_copy_fallback_error(exc):
+                raise
+
             logger.info(
-                "copy_message not possible (%s); falling back to download/upload",
+                "copy_message fallback for source %s (%s); refreshing before re-upload",
+                getattr(source_msg, "id", None),
                 type(exc).__name__,
             )
 
-    await reupload(reader, source_msg, target_chat, thread_id, on_stage, sender=sender)
+            refreshed = await _refresh_source_message(
+                reader,
+                source_chat,
+                getattr(source_msg, "id", None)
+            )
+
+            if refreshed is not None:
+                current_msg = refreshed
+
+            # For an expired file reference, try copy once more with the newly
+            # fetched message. If Telegram still rejects it, download and re-upload.
+            if _is_file_reference_error(exc) and refreshed is not None:
+                try:
+                    await safe_execute(
+                        reader.copy_message,
+                        chat_id=target_chat,
+                        from_chat_id=source_chat,
+                        message_id=current_msg.id,
+                        message_thread_id=thread_id,
+                    )
+                    return "copied_after_refresh"
+
+                except Exception as retry_exc:  # noqa: BLE001
+                    if not _is_copy_fallback_error(retry_exc):
+                        raise
+
+                    logger.info(
+                        "copy still unavailable after refresh for message %s (%s); re-uploading",
+                        current_msg.id,
+                        type(retry_exc).__name__,
+                    )
+
+    await reupload(
+        reader,
+        current_msg,
+        target_chat,
+        thread_id,
+        on_stage,
+        sender=sender,
+        source_chat=source_chat,
+    )
+
     return "reuploaded"
