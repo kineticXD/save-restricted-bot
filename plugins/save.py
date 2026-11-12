@@ -22,12 +22,11 @@ from plugins.transfer import (
 
 logger = logging.getLogger(__name__)
 
-MAX_BATCH = 500
-
-# Forum topics share one chat-wide message-ID sequence.
-# This is the maximum number of IDs to inspect, NOT the batch size.
-MAX_SCAN_SPAN = 10_000
-
+MAX_BATCH = 500                    # selected-topic messages per range
+MAX_SCAN_SPAN = 10_000             # chat-wide message IDs to inspect per range
+MAX_BATCH_RANGES = 10              # up to 10 start/end pairs in one command
+MAX_MULTI_SCAN_SPAN = 50_000       # total ID span across all ranges
+MAX_MULTI_MESSAGES = 2_000        # total selected messages across all ranges
 FETCH_CHUNK = 100
 active_jobs = {}
 
@@ -45,24 +44,26 @@ def get_poster(client: Client) -> Client:
 
 def _telegram_error_text(exc: Exception) -> str:
     name = type(exc).__name__
-
+    text = str(exc)
+    if "FILE_REFERENCE_EXPIRED" in text.upper() or "FILEREFERENCEEXPIRED" in name.upper():
+        return (
+            "Telegram's media reference expired. The bot attempted to refresh the source message; "
+            "try this item again if the refreshed download also failed."
+        )
     if name in {"ChatWriteForbidden", "ChatAdminRequired", "ChatRestricted"}:
         return (
             "The bot cannot post in the destination group. Check that regular members "
             "are allowed to send messages and media. If the group is admin-only, Telegram "
             "requires admin permission; this bot will not bypass that restriction."
         )
-
     if name in {"UserNotParticipant", "PeerIdInvalid", "ChannelPrivate"}:
         return (
             "The bot cannot access the destination group. Add the bot to that group as a "
             "regular member, then run /settarget again."
         )
-
     if name in {"SlowmodeWait", "FloodWait"}:
         return f"Telegram rate-limited the upload ({exc}). Wait, then try again."
-
-    return str(exc)
+    return text
 
 
 async def _destination(client, message):
@@ -70,196 +71,102 @@ async def _destination(client, message):
 
 
 async def _edit_status(status_message: Message, text: str):
-    """Make status edits resilient to duplicate, stale, or rate-limited updates."""
+    """Status edits are best-effort and must not stop a transfer."""
     try:
-        await status_message.edit_text(
-            text,
-            parse_mode=enums.ParseMode.DISABLED
-        )
-    except Exception as exc:
-        name = type(exc).__name__
-
-        if name in {
-            "MessageNotModified",
-            "MessageIdInvalid",
-            "MessageToEditNotFound"
-        }:
+        await status_message.edit_text(text, parse_mode=enums.ParseMode.DISABLED)
+    except Exception as exc:  # noqa: BLE001
+        if type(exc).__name__ in {"MessageNotModified", "MessageIdInvalid", "MessageToEditNotFound"}:
             return
-
         logger.debug("Could not update transfer status: %s", exc)
 
 
 async def _fetch_messages_ordered(reader, chat_id, message_ids):
-    """Fetch IDs in chunks and restore ascending message-ID order."""
+    """Fetch in chunks and restore ascending source-message ID order."""
     by_id = {}
     ids = list(message_ids)
-
     for offset in range(0, len(ids), FETCH_CHUNK):
         chunk = ids[offset:offset + FETCH_CHUNK]
-
         try:
             try:
-                result = await reader.get_messages(
-                    chat_id,
-                    message_ids=chunk,
-                    replies=0
-                )
+                result = await reader.get_messages(chat_id, message_ids=chunk, replies=0)
             except TypeError:
                 result = await reader.get_messages(chat_id, chunk)
-
             if not isinstance(result, (list, tuple)):
                 result = [result]
-
             for item in result:
                 if item is not None and getattr(item, "id", None) is not None:
                     by_id[int(item.id)] = item
-
-        except Exception as exc:
-            logger.warning(
-                "Chunk fetch failed for %s (%s); retrying IDs individually",
-                chunk,
-                exc
-            )
-
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Chunk fetch failed for %s (%s); retrying IDs individually", chunk, exc)
             for message_id in chunk:
                 try:
                     item = await reader.get_messages(chat_id, message_id)
-
                     if item is not None and getattr(item, "id", None) is not None:
                         by_id[int(item.id)] = item
-
                 except Exception:
-                    logger.exception(
-                        "Could not fetch source message %s",
-                        message_id
-                    )
-
+                    logger.exception("Could not fetch source message %s", message_id)
     return [by_id.get(int(message_id)) for message_id in ids]
 
 
 async def _safe_get_chat(reader, chat_id):
     try:
         return await reader.get_chat(chat_id)
-    except Exception as exc:
-        logger.warning(
-            "Could not inspect source chat %s: %s",
-            chat_id,
-            exc
-        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Could not inspect source chat %s: %s", chat_id, exc)
         return None
 
 
-def _resolve_batch_topic(
-    start_ref,
-    end_ref,
-    start_msg,
-    end_msg,
-    source_chat
-):
-    """Resolve one topic for the entire range."""
-    explicit = [
-        value
-        for value in (start_ref.topic_id, end_ref.topic_id)
-        if value is not None
-    ]
-
+def _resolve_batch_topic(start_ref, end_ref, start_msg, end_msg, source_chat):
+    """Resolve and validate the topic shared by both boundary links."""
+    explicit = [value for value in (start_ref.topic_id, end_ref.topic_id) if value is not None]
     if len(set(explicit)) > 1:
-        raise ValueError(
-            "The two links point to different forum topics. "
-            "Use two links from the same topic."
-        )
+        raise ValueError("The two links point to different forum topics. Use two links from the same topic.")
 
     start_topic = get_message_topic_id(start_msg)
     end_topic = get_message_topic_id(end_msg)
-
-    inferred = [
-        value
-        for value in (start_topic, end_topic)
-        if value is not None
-    ]
-
+    inferred = [value for value in (start_topic, end_topic) if value is not None]
     if len(set(inferred)) > 1:
-        raise ValueError(
-            "The first and last messages belong to different forum topics."
-        )
+        raise ValueError("The first and last messages belong to different forum topics.")
 
-    topic_id = (
-        explicit[0]
-        if explicit
-        else (inferred[0] if inferred else None)
-    )
-
-    is_forum = (
-        bool(getattr(source_chat, "is_forum", False))
-        if source_chat else False
-    )
-
+    topic_id = explicit[0] if explicit else (inferred[0] if inferred else None)
+    is_forum = bool(getattr(source_chat, "is_forum", False)) if source_chat else False
     if is_forum and topic_id is None:
-        topic_id = 1
+        topic_id = 1  # Telegram General topic
 
     if topic_id is not None:
         if not message_belongs_to_topic(start_msg, topic_id):
-            raise ValueError(
-                "The first link does not belong to the selected forum topic."
-            )
-
+            raise ValueError("The first link does not belong to the selected forum topic.")
         if not message_belongs_to_topic(end_msg, topic_id):
-            raise ValueError(
-                "The second link does not belong to the selected forum topic."
-            )
-
+            raise ValueError("The last link does not belong to the selected forum topic.")
     return topic_id
 
 
 async def _try_album(
-    reader,
-    poster,
-    source_msg,
-    chat_id,
-    start_id,
-    end_id,
-    topic_id,
-    target_chat,
-    target_thread,
-    on_stage
+    reader, poster, source_msg, chat_id, start_id, end_id, topic_id,
+    target_chat, target_thread, on_stage, already_processed=None,
 ):
-    """Preserve a 2–10 item album when possible."""
+    """Preserve a 2–10 item album where possible; return source IDs consumed."""
     group_id = getattr(source_msg, "media_group_id", None)
-
     if not group_id or not hasattr(reader, "get_media_group"):
         return []
 
     try:
-        group = await reader.get_media_group(
-            chat_id,
-            source_msg.id
-        )
-    except Exception as exc:
-        logger.debug(
-            "Media-group lookup unavailable for %s: %s",
-            source_msg.id,
-            exc
-        )
+        group = await reader.get_media_group(chat_id, source_msg.id)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("Media-group lookup unavailable for %s: %s", source_msg.id, exc)
         return []
 
+    already_processed = already_processed or set()
     in_range = [
-        item
-        for item in (group or [])
+        item for item in (group or [])
         if item
         and start_id <= int(getattr(item, "id", 0) or 0) <= end_id
+        and (chat_id, int(getattr(item, "id", 0) or 0)) not in already_processed
         and message_belongs_to_topic(item, topic_id)
         and not getattr(item, "empty", False)
     ]
-
     in_range.sort(key=lambda item: int(item.id))
-
     if len(in_range) < 2:
-        return []
-
-    if any(
-        not message_belongs_to_topic(item, topic_id)
-        for item in in_range
-    ):
         return []
 
     try:
@@ -270,61 +177,100 @@ async def _try_album(
             target_chat,
             thread_id=target_thread,
             on_stage=on_stage,
+            source_chat=chat_id,
         )
-
         if sent:
             return [int(item.id) for item in in_range]
-
     except UnsupportedMedia:
-        logger.info(
-            "Album %s cannot be sent as one Telegram media group; "
-            "sending items individually",
-            group_id
-        )
-
+        logger.info("Album %s is not supported as a media group; sending items individually", group_id)
     except Exception:
-        logger.exception(
-            "Album upload failed for media_group_id=%s",
-            group_id
-        )
+        logger.exception("Album upload failed for media_group_id=%s", group_id)
         raise
-
     return []
 
 
-@Client.on_message(
-    filters.command("save") & filters.user(OWNER_ID)
-)
-async def save_single(client: Client, message: Message):
+async def _prepare_range(reader, start_ref, end_ref, range_number):
+    """Fetch and topic-filter one pair before any uploads begin."""
+    if start_ref.chat_id != end_ref.chat_id:
+        raise ValueError(f"Range {range_number}: both links must belong to the same Telegram chat.")
 
-    if len(message.command) < 2:
-        await message.reply_text(
-            "Usage: /save <telegram_message_link>\n"
-            "Open /menu for the button dashboard."
+    start_id, end_id = start_ref.message_id, end_ref.message_id
+    if start_id > end_id:
+        raise ValueError(f"Range {range_number}: the first link must be older than the second link.")
+
+    scan_span = end_id - start_id + 1
+    if scan_span > MAX_SCAN_SPAN:
+        raise ValueError(
+            f"Range {range_number}: this ID span is {scan_span:,}; per-range scan limit is "
+            f"{MAX_SCAN_SPAN:,}. This is a scan-safety limit, not the topic message limit."
         )
+
+    source_chat = await _safe_get_chat(reader, start_ref.chat_id)
+    boundaries = await _fetch_messages_ordered(reader, start_ref.chat_id, [start_id, end_id])
+    first_msg, last_msg = boundaries[0], boundaries[-1]
+
+    if not first_msg or getattr(first_msg, "empty", False):
+        raise ValueError(f"Range {range_number}: first link points to a missing or inaccessible message.")
+    if not last_msg or getattr(last_msg, "empty", False):
+        raise ValueError(f"Range {range_number}: last link points to a missing or inaccessible message.")
+
+    topic_id = _resolve_batch_topic(start_ref, end_ref, first_msg, last_msg, source_chat)
+    ordered_messages = await _fetch_messages_ordered(
+        reader, start_ref.chat_id, range(start_id, end_id + 1)
+    )
+
+    topic_messages = []
+    ignored_other_topics = 0
+    unavailable_ids = 0
+
+    for message_id, source_msg in zip(range(start_id, end_id + 1), ordered_messages):
+        if not source_msg or getattr(source_msg, "empty", False):
+            unavailable_ids += 1
+            continue
+        if not message_belongs_to_topic(source_msg, topic_id):
+            ignored_other_topics += 1
+            continue
+        topic_messages.append((message_id, source_msg))
+
+    if len(topic_messages) > MAX_BATCH:
+        raise ValueError(
+            f"Range {range_number}: selected topic contains {len(topic_messages):,} messages; "
+            f"per-range maximum is {MAX_BATCH:,}."
+        )
+    if not topic_messages:
+        raise ValueError(f"Range {range_number}: no accessible messages found in the selected topic.")
+
+    return {
+        "number": range_number,
+        "chat_id": start_ref.chat_id,
+        "start_id": start_id,
+        "end_id": end_id,
+        "topic_id": topic_id,
+        "messages": topic_messages,
+        "ignored": ignored_other_topics,
+        "unavailable": unavailable_ids,
+        "scan_span": scan_span,
+    }
+
+
+@Client.on_message(filters.command("save") & filters.user(OWNER_ID))
+async def save_single(client: Client, message: Message):
+    if len(message.command) < 2:
+        await message.reply_text("Usage: /save <telegram_message_link>\nOpen /menu for the button dashboard.")
         return
 
     reference = parse_telegram_message_link(message.command[1])
-
     if not reference:
-        await message.reply_text(
-            "❌ Invalid Telegram message link. "
-            "Please copy the direct message link."
-        )
+        await message.reply_text("❌ Invalid Telegram message link. Please copy the direct message link.")
         return
 
     try:
-        target_chat, target_thread = await _destination(
-            client,
-            message
-        )
+        target_chat, target_thread = await _destination(client, message)
     except LookupError as exc:
         await message.reply_text(f"🎯 {exc}")
         return
 
-    status_msg = await message.reply_text(
-        "⏳ Preparing upload..."
-    )
+    status_msg = await message.reply_text("⏳ Preparing upload...")
 
     async def on_stage(text: str):
         await _edit_status(status_msg, text)
@@ -332,469 +278,324 @@ async def save_single(client: Client, message: Message):
     try:
         reader = get_userbot(client)
         poster = get_poster(client)
-
-        problem = await prepare_chats(
-            reader,
-            reference.chat_id,
-            target_chat,
-            sender=poster
-        )
-
+        problem = await prepare_chats(reader, reference.chat_id, target_chat, sender=poster)
         if problem:
-            await _edit_status(
-                status_msg,
-                f"❌ {problem}"
-            )
+            await _edit_status(status_msg, f"❌ {problem}")
             return
 
-        source_msg = await reader.get_messages(
-            reference.chat_id,
-            reference.message_id
-        )
-
+        source_msg = await reader.get_messages(reference.chat_id, reference.message_id)
         if not source_msg or getattr(source_msg, "empty", False):
-            await _edit_status(
-                status_msg,
-                "❌ Message not found. It may have been deleted or is inaccessible."
-            )
+            await _edit_status(status_msg, "❌ Message not found. It may have been deleted or is inaccessible.")
             return
-
-        if (
-            reference.topic_id is not None
-            and not message_belongs_to_topic(
-                source_msg,
-                reference.topic_id
-            )
-        ):
-            await _edit_status(
-                status_msg,
-                "❌ The linked message does not match the topic shown in the Telegram link."
-            )
+        if reference.topic_id is not None and not message_belongs_to_topic(source_msg, reference.topic_id):
+            await _edit_status(status_msg, "❌ The linked message does not match the topic shown in the Telegram link.")
             return
 
         await copy_or_reupload(
-            reader,
-            reference.chat_id,
-            source_msg,
-            target_chat,
-            thread_id=target_thread,
-            on_stage=on_stage,
-            sender=poster,
+            reader, reference.chat_id, source_msg, target_chat,
+            thread_id=target_thread, on_stage=on_stage, sender=poster,
         )
-
-        await _edit_status(
-            status_msg,
-            "✅ Uploaded successfully to your destination group."
-        )
+        await _edit_status(status_msg, "✅ Uploaded successfully to your destination group.")
 
     except UnsupportedMedia as exc:
-        await _edit_status(
-            status_msg,
-            f"⚠️ Skipped: {exc}"
-        )
-
-    except Exception as exc:
+        await _edit_status(status_msg, f"⚠️ Skipped: {exc}")
+    except Exception as exc:  # noqa: BLE001
         logger.exception("/save failed")
-
-        await _edit_status(
-            status_msg,
-            f"❌ Upload failed: {_telegram_error_text(exc)}"
-        )
+        await _edit_status(status_msg, f"❌ Upload failed: {_telegram_error_text(exc)}")
 
 
-@Client.on_message(
-    filters.command("batch") & filters.user(OWNER_ID)
-)
+@Client.on_message(filters.command(["batch", "multibatch"]) & filters.user(OWNER_ID))
 async def save_batch(client: Client, message: Message):
+    """Accept /batch start end, or /multibatch start1 end1 start2 end2 ..."""
+    args = list(message.command[1:])
+    command_name = str(message.command[0]).split("@", 1)[0].lstrip("/").lower()
 
-    if len(message.command) < 3:
+    if len(args) < 2 or len(args) % 2:
         await message.reply_text(
-            "Usage: /batch <first_link> <last_link>\n"
-            "Both links must be from the same chat and the same forum topic."
+            "Usage:\n"
+            "/batch <first_link> <last_link>\n"
+            "/multibatch <start1> <end1> <start2> <end2> [<start3> <end3> ...]\n\n"
+            f"Provide complete start/end pairs. Maximum: {MAX_BATCH_RANGES} ranges.\n"
+            "The bot processes ranges in the exact order supplied, and messages in each range in ascending order."
         )
         return
 
-    start_ref = parse_telegram_message_link(
-        message.command[1]
+    pairs_count = len(args) // 2
+    if pairs_count > MAX_BATCH_RANGES:
+        await message.reply_text(f"❌ Too many ranges. Maximum is {MAX_BATCH_RANGES} start/end pairs.")
+        return
+    if command_name == "multibatch" and pairs_count < 2:
+        await message.reply_text("❌ /multibatch needs at least two start/end pairs (four links).")
+        return
+
+    parsed_pairs = []
+    for index in range(pairs_count):
+        start_ref = parse_telegram_message_link(args[index * 2])
+        end_ref = parse_telegram_message_link(args[index * 2 + 1])
+        if not start_ref or not end_ref:
+            await message.reply_text(f"❌ Range {index + 1}: one of its Telegram links is invalid.")
+            return
+        parsed_pairs.append((start_ref, end_ref))
+
+    total_scan_span = sum(
+        max(0, end_ref.message_id - start_ref.message_id + 1)
+        for start_ref, end_ref in parsed_pairs
     )
-
-    end_ref = parse_telegram_message_link(
-        message.command[2]
-    )
-
-    if not start_ref or not end_ref:
+    if total_scan_span > MAX_MULTI_SCAN_SPAN:
         await message.reply_text(
-            "❌ One of the Telegram message links is invalid."
+            f"❌ Combined message-ID scan span is {total_scan_span:,}; "
+            f"multi-range scan limit is {MAX_MULTI_SCAN_SPAN:,}. "
+            "Use narrower boundary links or split the work into two commands."
         )
         return
 
-    if start_ref.chat_id != end_ref.chat_id:
-        await message.reply_text(
-            "❌ Both links must belong to the same Telegram chat."
-        )
-        return
-
-    start_id = start_ref.message_id
-    end_id = end_ref.message_id
-
-    if start_id > end_id:
-        await message.reply_text(
-            "❌ The first link must be older than or equal to the second link."
-        )
-        return
-
-    # IMPORTANT:
-    # Do not compare this span with MAX_BATCH.
-    # Forum message IDs are shared across every topic.
-    scan_span = end_id - start_id + 1
-
-    if scan_span > MAX_SCAN_SPAN:
-        await message.reply_text(
-            f"❌ The message-ID span is too wide to scan safely "
-            f"({scan_span:,} IDs).\n\n"
-            f"The scan limit is {MAX_SCAN_SPAN:,} IDs.\n"
-            "This is NOT the topic message limit. Messages from "
-            "other forum topics are excluded from the actual batch count.\n\n"
-            "Please use closer boundary links."
-        )
-        return
+    # Validate the link pairs before reserving the job or sending anything.
+    for index, (start_ref, end_ref) in enumerate(parsed_pairs, start=1):
+        if start_ref.chat_id != end_ref.chat_id:
+            await message.reply_text(f"❌ Range {index}: both links must be from the same Telegram chat.")
+            return
+        if start_ref.message_id > end_ref.message_id:
+            await message.reply_text(f"❌ Range {index}: start link must be older than end link.")
+            return
+        if end_ref.message_id - start_ref.message_id + 1 > MAX_SCAN_SPAN:
+            await message.reply_text(
+                f"❌ Range {index} exceeds the per-range scan limit of {MAX_SCAN_SPAN:,} IDs."
+            )
+            return
 
     try:
-        target_chat, target_thread = await _destination(
-            client,
-            message
-        )
-
+        target_chat, target_thread = await _destination(client, message)
     except LookupError as exc:
         await message.reply_text(f"🎯 {exc}")
         return
 
     owner_key = int(OWNER_ID)
-
     if owner_key in active_jobs:
-        await message.reply_text(
-            "⚠️ A batch is already running. Use /cancel to stop it first."
-        )
+        await message.reply_text("⚠️ A batch is already running. Use /cancel to stop it first.")
         return
 
     cancel_event = asyncio.Event()
     active_jobs[owner_key] = cancel_event
-
     status_msg = await message.reply_text(
-        f"⏳ Starting topic-aware batch\n"
-        f"Range: {start_id} → {end_id}\n"
-        f"Message IDs to inspect: {scan_span:,}\n"
-        f"Maximum messages in selected topic: {MAX_BATCH}\n"
-        f"Uploaded: 0"
+        f"⏳ Preparing {pairs_count} range(s)...\n"
+        f"Combined ID scan span: {total_scan_span:,}\n"
+        "No uploads will start until every range has been checked."
     )
 
     try:
         reader = get_userbot(client)
         poster = get_poster(client)
 
-        problem = await prepare_chats(
-            reader,
-            start_ref.chat_id,
-            target_chat,
-            sender=poster
+        # Preflight all sources, then upload. This avoids starting range 1 only to
+        # discover that range 3 is malformed or inaccessible.
+        prepared_ranges = []
+        peer_checks = set()
+
+        for index, (start_ref, end_ref) in enumerate(parsed_pairs, start=1):
+            if cancel_event.is_set():
+                await _edit_status(status_msg, "🛑 Cancelled during preparation; nothing was uploaded.")
+                return
+
+            source_key = str(start_ref.chat_id)
+            if source_key not in peer_checks:
+                problem = await prepare_chats(reader, start_ref.chat_id, target_chat, sender=poster)
+                if problem:
+                    raise RuntimeError(f"Range {index}: {problem}")
+                peer_checks.add(source_key)
+
+            await _edit_status(
+                status_msg,
+                f"🔎 Checking range {index}/{pairs_count}...\n"
+                f"Source chat: {start_ref.chat_id}\n"
+                f"IDs: {start_ref.message_id} → {end_ref.message_id}"
+            )
+            prepared = await _prepare_range(reader, start_ref, end_ref, index)
+            prepared_ranges.append(prepared)
+
+        # Remove overlapping duplicates while preserving the order of the
+        # supplied ranges and the ascending order within each range.
+        seen_messages = set()
+        duplicate_count = 0
+
+        for prepared in prepared_ranges:
+            unique_messages = []
+            for message_id, source_msg in prepared["messages"]:
+                key = (str(prepared["chat_id"]), int(message_id))
+                if key in seen_messages:
+                    duplicate_count += 1
+                    continue
+                seen_messages.add(key)
+                unique_messages.append((message_id, source_msg))
+            prepared["messages"] = unique_messages
+
+        selected_total = sum(len(item["messages"]) for item in prepared_ranges)
+        if selected_total > MAX_MULTI_MESSAGES:
+            raise ValueError(
+                f"The selected ranges contain {selected_total:,} unique topic messages; "
+                f"the multi-range safety limit is {MAX_MULTI_MESSAGES:,}."
+            )
+        if selected_total == 0:
+            raise ValueError("No accessible messages were found in the supplied ranges.")
+
+        ignored_total = sum(item["ignored"] for item in prepared_ranges)
+        unavailable_total = sum(item["unavailable"] for item in prepared_ranges)
+        summary = "\n".join(
+            f"{item['number']}. Topic {item['topic_id'] or '—'}: {len(item['messages'])} messages"
+            for item in prepared_ranges
         )
-
-        if problem:
-            await _edit_status(
-                status_msg,
-                f"❌ {problem}"
-            )
-            return
-
-        source_chat = await _safe_get_chat(
-            reader,
-            start_ref.chat_id
-        )
-
-        boundary_messages = await _fetch_messages_ordered(
-            reader,
-            start_ref.chat_id,
-            [start_id, end_id]
-        )
-
-        first_msg = boundary_messages[0]
-        last_msg = boundary_messages[-1]
-
-        if not first_msg or getattr(first_msg, "empty", False):
-            await _edit_status(
-                status_msg,
-                "❌ The first link points to a missing or inaccessible message."
-            )
-            return
-
-        if not last_msg or getattr(last_msg, "empty", False):
-            await _edit_status(
-                status_msg,
-                "❌ The second link points to a missing or inaccessible message."
-            )
-            return
-
-        try:
-            topic_id = _resolve_batch_topic(
-                start_ref,
-                end_ref,
-                first_msg,
-                last_msg,
-                source_chat
-            )
-
-        except ValueError as exc:
-            await _edit_status(
-                status_msg,
-                f"❌ {exc}"
-            )
-            return
 
         await _edit_status(
             status_msg,
-            f"🔎 Checking messages in order...\n"
-            f"Range: {start_id} → {end_id}\n"
-            f"Source topic: {topic_id if topic_id is not None else 'not a forum'}"
-        )
-
-        # Fetch the chat-wide ID range.
-        ordered_messages = await _fetch_messages_ordered(
-            reader,
-            start_ref.chat_id,
-            range(start_id, end_id + 1)
-        )
-
-        # FIRST FILTER THE TOPIC.
-        # Only AFTER filtering do we enforce the actual batch limit.
-        topic_messages = []
-        ignored_other_topics = 0
-        missing_count = 0
-
-        for message_id, source_msg in zip(
-            range(start_id, end_id + 1),
-            ordered_messages
-        ):
-
-            if not source_msg or getattr(source_msg, "empty", False):
-                missing_count += 1
-                continue
-
-            if not message_belongs_to_topic(
-                source_msg,
-                topic_id
-            ):
-                ignored_other_topics += 1
-                continue
-
-            topic_messages.append(
-                (message_id, source_msg)
-            )
-
-        topic_total = len(topic_messages)
-
-        # MAX_BATCH now applies to the actual selected topic.
-        if topic_total > MAX_BATCH:
-            await _edit_status(
-                status_msg,
-                f"❌ This selected topic contains {topic_total:,} messages.\n"
-                f"The maximum batch size is {MAX_BATCH:,}.\n\n"
-                f"Messages from other topics ({ignored_other_topics:,}) were excluded."
-            )
-            return
-
-        if topic_total == 0:
-            await _edit_status(
-                status_msg,
-                "❌ No accessible messages from the selected topic "
-                "were found between these links. Check that both links "
-                "belong to the same topic."
-            )
-            return
-
-        await _edit_status(
-            status_msg,
-            f"✅ Found {topic_total:,} messages in the selected topic.\n"
-            f"Ignored other topics: {ignored_other_topics:,}\n"
-            f"Missing/deleted messages: {missing_count:,}\n"
-            "Starting upload in message order..."
+            f"✅ All {pairs_count} ranges checked.\n"
+            f"Unique selected messages: {selected_total}\n"
+            f"Other-topic messages ignored: {ignored_total}\n"
+            f"Unavailable message IDs: {unavailable_total}\n"
+            f"Overlapping duplicates removed: {duplicate_count}\n\n"
+            f"Upload order:\n{summary}\n\nStarting uploads in the supplied range order..."
         )
 
         success_count = 0
         errors = []
         cancelled = False
-
         processed_ids = set()
         processed_albums = set()
+        attempted_count = 0
 
         async def on_stage(text: str):
-            await _edit_status(
-                status_msg,
-                text
-            )
+            await _edit_status(status_msg, text)
 
-        # Upload only the already-filtered topic messages.
-        # Their order is ascending by original Telegram message ID.
-        for done, (message_id, source_msg) in enumerate(
-            topic_messages,
-            start=1
-        ):
-
+        for prepared in prepared_ranges:
             if cancel_event.is_set():
                 cancelled = True
                 break
 
-            if message_id in processed_ids:
-                continue
+            range_number = prepared["number"]
+            chat_id = prepared["chat_id"]
+            start_id = prepared["start_id"]
+            end_id = prepared["end_id"]
+            topic_id = prepared["topic_id"]
+            messages = prepared["messages"]
 
-            if not guard.check_circuit():
-                errors.append(
-                    "Safety circuit opened; batch stopped early to protect the account."
-                )
-                break
+            await _edit_status(
+                status_msg,
+                f"📤 Starting range {range_number}/{pairs_count}\n"
+                f"Topic: {topic_id or '—'}\n"
+                f"Messages in this range: {len(messages)}\n"
+                f"Overall uploaded: {success_count}/{selected_total}"
+            )
 
-            try:
-                media_group_id = getattr(
-                    source_msg,
-                    "media_group_id",
-                    None
-                )
-
-                if (
-                    media_group_id
-                    and media_group_id not in processed_albums
-                ):
-
-                    consumed = await _try_album(
-                        reader,
-                        poster,
-                        source_msg,
-                        start_ref.chat_id,
-                        start_id,
-                        end_id,
-                        topic_id,
-                        target_chat,
-                        target_thread,
-                        on_stage,
-                    )
-
-                    if consumed:
-                        success_count += len(consumed)
-
-                        processed_ids.update(consumed)
-                        processed_albums.add(media_group_id)
-
-                        if done % 5 == 0 or done == topic_total:
-                            await _edit_status(
-                                status_msg,
-                                "📤 Batch in progress\n"
-                                f"Selected-topic messages: {done}/{topic_total}\n"
-                                f"Uploaded: {success_count}\n"
-                                f"Ignored other topics: {ignored_other_topics}\n"
-                                f"Missing/deleted: {missing_count}\n"
-                                f"Issues: {len(errors)}\n\n"
-                                "Use /cancel to stop."
-                            )
-
-                        continue
-
-                    processed_albums.add(media_group_id)
-
-                await copy_or_reupload(
-                    reader,
-                    start_ref.chat_id,
-                    source_msg,
-                    target_chat,
-                    thread_id=target_thread,
-                    on_stage=on_stage,
-                    sender=poster,
-                )
-
-                success_count += 1
-
-            except UnsupportedMedia as exc:
-                errors.append(
-                    f"Message {message_id}: skipped — {exc}"
-                )
-
-            except Exception as exc:
-                logger.exception(
-                    "Batch item %s failed",
-                    message_id
-                )
-
-                errors.append(
-                    f"Message {message_id}: {_telegram_error_text(exc)}"
-                )
-
-                if type(exc).__name__ in {
-                    "ChatWriteForbidden",
-                    "ChatAdminRequired",
-                    "ChatRestricted",
-                    "UserNotParticipant"
-                }:
+            for position, (message_id, source_msg) in enumerate(messages, start=1):
+                if cancel_event.is_set():
+                    cancelled = True
                     break
 
-            if done % 5 == 0 or done == topic_total:
-                await _edit_status(
-                    status_msg,
-                    "📤 Batch in progress\n"
-                    f"Selected-topic messages: {done}/{topic_total}\n"
-                    f"Uploaded: {success_count}\n"
-                    f"Ignored other topics: {ignored_other_topics}\n"
-                    f"Missing/deleted: {missing_count}\n"
-                    f"Issues: {len(errors)}\n\n"
-                    "Use /cancel to stop."
-                )
+                global_key = (str(chat_id), int(message_id))
+                if global_key in processed_ids:
+                    continue
+                if not guard.check_circuit():
+                    errors.append("Safety circuit opened; batch stopped early to protect the account.")
+                    cancelled = True
+                    break
 
+                try:
+                    media_group_id = getattr(source_msg, "media_group_id", None)
+                    album_key = (str(chat_id), str(media_group_id)) if media_group_id else None
+
+                    if album_key and album_key not in processed_albums:
+                        consumed = await _try_album(
+                            reader, poster, source_msg, chat_id,
+                            start_id, end_id, topic_id,
+                            target_chat, target_thread, on_stage,
+                            already_processed=processed_ids,
+                        )
+                        processed_albums.add(album_key)
+
+                        if consumed:
+                            for consumed_id in consumed:
+                                processed_ids.add((str(chat_id), int(consumed_id)))
+                            success_count += len(consumed)
+                            attempted_count += len(consumed)
+
+                            if position % 5 == 0 or position == len(messages):
+                                await _edit_status(
+                                    status_msg,
+                                    f"📤 Uploading range {range_number}/{pairs_count}\n"
+                                    f"Range progress: {position}/{len(messages)}\n"
+                                    f"Overall uploaded: {success_count}/{selected_total}\n"
+                                    f"Issues: {len(errors)}\nUse /cancel to stop."
+                                )
+                            continue
+
+                    await copy_or_reupload(
+                        reader, chat_id, source_msg, target_chat,
+                        thread_id=target_thread,
+                        on_stage=on_stage,
+                        sender=poster,
+                    )
+                    success_count += 1
+                    attempted_count += 1
+                    processed_ids.add(global_key)
+
+                except UnsupportedMedia as exc:
+                    errors.append(f"Range {range_number}, message {message_id}: skipped — {exc}")
+                    processed_ids.add(global_key)
+
+                except Exception as exc:  # noqa: BLE001
+                    logger.exception("Range %s message %s failed", range_number, message_id)
+                    errors.append(f"Range {range_number}, message {message_id}: {_telegram_error_text(exc)}")
+                    processed_ids.add(global_key)
+
+                    if type(exc).__name__ in {
+                        "ChatWriteForbidden", "ChatAdminRequired", "ChatRestricted", "UserNotParticipant"
+                    }:
+                        cancelled = True
+                        break
+
+                if position % 5 == 0 or position == len(messages):
+                    await _edit_status(
+                        status_msg,
+                        f"📤 Uploading range {range_number}/{pairs_count}\n"
+                        f"Range progress: {position}/{len(messages)}\n"
+                        f"Overall uploaded: {success_count}/{selected_total}\n"
+                        f"Issues: {len(errors)}\nUse /cancel to stop."
+                    )
+
+            if cancelled:
+                break
+
+        final_status = "🛑 Multi-batch cancelled." if cancelled else "✅ Multi-batch finished."
         result = (
-            ("🛑 Batch cancelled.\n" if cancelled else "✅ Batch finished.\n")
-            + f"Uploaded: {success_count}\n"
-            + f"Ignored messages from other topics: {ignored_other_topics}\n"
-            + f"Missing messages: {missing_count}\n"
-            + f"Issues: {len(errors)}"
+            f"{final_status}\n"
+            f"Ranges processed: {pairs_count}\n"
+            f"Uploaded: {success_count}\n"
+            f"Skipped/unavailable source IDs: {unavailable_total}\n"
+            f"Ignored messages from other topics: {ignored_total}\n"
+            f"Overlapping duplicates removed: {duplicate_count}\n"
+            f"Issues: {len(errors)}"
         )
 
         if errors:
-            result += (
-                "\n\nFirst issues:\n"
-                + "\n".join(f"• {item[:220]}" for item in errors[:5])
-            )
-
+            result += "\n\nFirst issues:\n" + "\n".join(f"• {item[:220]}" for item in errors[:5])
             if len(errors) > 5:
                 result += f"\n• ...and {len(errors) - 5} more."
 
-        await _edit_status(
-            status_msg,
-            result
-        )
+        await _edit_status(status_msg, result)
 
-    except Exception as exc:
-        logger.exception("/batch failed")
-
-        await _edit_status(
-            status_msg,
-            f"❌ Batch failed: {_telegram_error_text(exc)}"
-        )
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Batch preparation/upload failed")
+        await _edit_status(status_msg, f"❌ Batch failed: {_telegram_error_text(exc)}")
 
     finally:
         active_jobs.pop(owner_key, None)
 
 
-@Client.on_message(
-    filters.command("cancel") & filters.user(OWNER_ID)
-)
+@Client.on_message(filters.command("cancel") & filters.user(OWNER_ID))
 async def cancel_batch(client: Client, message: Message):
-
     event = active_jobs.get(int(OWNER_ID))
-
     if not event:
-        await message.reply_text(
-            "There is no active batch to cancel."
-        )
+        await message.reply_text("There is no active batch to cancel.")
         return
-
     event.set()
-
     await message.reply_text(
         "🛑 Cancellation requested. The current upload will finish, then the batch will stop."
     )
