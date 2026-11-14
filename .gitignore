@@ -9,3 +9,7 @@
 __pycache__/
 *.py[cod]
 .venv/
+
+# Runtime database and custom thumbnails
+data/
+custom_thumbs/
