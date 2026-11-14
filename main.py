@@ -8,6 +8,7 @@ from threading import Thread
 
 from flask import Flask, jsonify
 from pyrogram import Client, idle
+from pyrogram.types import BotCommand
 from pyrogram.errors import FloodWait
 
 from config import API_ID, API_HASH, BOT_TOKEN, SESSION_STRING, OWNER_ID
@@ -35,13 +36,13 @@ def home():
     ready = state == "running"
     return f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Save Bot</title><style>
+<title>Waguri</title><style>
 :root{{color-scheme:dark}}*{{box-sizing:border-box}}body{{margin:0;min-height:100vh;display:grid;place-items:center;
 font:16px/1.5 system-ui,-apple-system,Segoe UI,sans-serif;color:#e5e7eb;background:radial-gradient(circle at 15% 15%,#1e3a8a 0,transparent 36%),#0b1020}}
 main{{width:min(560px,calc(100% - 32px));padding:32px;border:1px solid #334155;border-radius:24px;background:#111827dd;
 box-shadow:0 24px 80px #0008}} .tag{{display:inline-block;padding:6px 11px;border:1px solid {'#166534' if ready else '#92400e'};border-radius:999px;color:{'#86efac' if ready else '#fcd34d'};font-size:13px}}
 h1{{font-size:30px;margin:18px 0 6px}}p{{color:#aab6c8}}.line{{height:1px;background:#263449;margin:22px 0}}.small{{font-size:13px;color:#8290a5}}
-</style></head><body><main><span class="tag">● {'TELEGRAM BOT READY' if ready else 'PROCESS ONLINE · TELEGRAM STARTING'}</span><h1>Save Bot</h1>
+</style></head><body><main><span class="tag">● {'TELEGRAM BOT READY' if ready else 'PROCESS ONLINE · TELEGRAM STARTING'}</span><h1>Waguri</h1>
 <p>Telegram state: <b>{state}</b>. Open your Telegram bot and use <b>/menu</b> when the bot is ready.</p>
 <div class="line"></div><div class="small">Transfers follow Telegram chat permissions. During a FloodWait, this service waits for Telegram's retry window instead of repeatedly restarting.</div>
 </main></body></html>"""
@@ -51,7 +52,7 @@ h1{{font-size:30px;margin:18px 0 6px}}p{{color:#aab6c8}}.line{{height:1px;backgr
 def health():
     return jsonify({
         "ok": True,
-        "service": "save-bot",
+        "service": "waguri",
         "telegram_state": BOT_STATE,
         "bot_ready": BOT_STATE == "running",
     })
@@ -110,6 +111,39 @@ def create_clients():
     return bot, userbot
 
 
+async def register_bot_commands(bot):
+    """Register the complete Bot menu command list through Telegram's Bot API."""
+    commands = [
+        BotCommand("start", "Open Waguri dashboard"),
+        BotCommand("menu", "Open the control panel"),
+        BotCommand("help", "Show all commands and examples"),
+        BotCommand("save", "Save one Telegram post"),
+        BotCommand("rename", "Upload one post with a new filename"),
+        BotCommand("batch", "Upload one message range"),
+        BotCommand("multibatch", "Upload multiple titled ranges"),
+        BotCommand("upload", "Upload the replied-to message"),
+        BotCommand("settarget", "Set the destination group"),
+        BotCommand("target", "Show the saved destination"),
+        BotCommand("cleartarget", "Clear the destination group"),
+        BotCommand("settings", "Show transfer preferences"),
+        BotCommand("setcaption", "Set append or replacement caption"),
+        BotCommand("clearcaption", "Clear custom caption"),
+        BotCommand("setthumb", "Set a custom thumbnail by replying to an image"),
+        BotCommand("clearthumb", "Clear custom thumbnail"),
+        BotCommand("setthumbmode", "Choose source, custom or no thumbnail"),
+        BotCommand("replaceword", "Add filename and caption replacement rule"),
+        BotCommand("clearreplace", "Clear all replacement rules"),
+        BotCommand("setpin", "Enable or disable auto-pin"),
+        BotCommand("stats", "Show transfer and safety status"),
+        BotCommand("cancel", "Cancel the active batch"),
+    ]
+    try:
+        await bot.set_bot_commands(commands)
+        logger.info("Registered %s Bot menu commands", len(commands))
+    except Exception:
+        logger.exception("Could not register Bot menu commands; use the BotFather list in README")
+
+
 async def stop_client(client, name):
     try:
         if client.is_connected:
@@ -137,6 +171,7 @@ async def main():
             await asyncio.wait_for(bot.start(), timeout=90)
             bme = await bot.get_me()
             logger.info("Bot Client started as @%s", bme.username)
+            await register_bot_commands(bot)
 
             BOT_STATE = "running"
             logger.info("Both clients started successfully. Bot is running!")
