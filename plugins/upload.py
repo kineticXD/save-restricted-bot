@@ -6,6 +6,7 @@ from pyrogram.types import Message
 from config import OWNER_ID
 from plugins.helpers import get_destination, prepare_chats
 from plugins.save import get_poster
+from storage import get_preferences
 from plugins.transfer import copy_or_reupload, UnsupportedMedia
 
 logger = logging.getLogger(__name__)
@@ -42,6 +43,7 @@ async def upload_replied_message(client: Client, message: Message):
         await copy_or_reupload(
             poster, source_chat, source_msg, target_chat,
             thread_id=thread_id, on_stage=on_stage, sender=poster,
+            preferences=get_preferences(OWNER_ID),
         )
         await status.edit_text("✅ **Message uploaded to the destination group.**")
     except UnsupportedMedia as exc:
