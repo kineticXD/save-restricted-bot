@@ -1,11 +1,13 @@
 
 import asyncio
 import logging
+import shlex
 
 from pyrogram import Client, filters, enums
 from pyrogram.types import Message
 
 from config import OWNER_ID
+from storage import get_preferences
 from plugins.helpers import (
     parse_telegram_message_link,
     message_belongs_to_topic,
@@ -13,6 +15,7 @@ from plugins.helpers import (
     get_destination,
     prepare_chats,
     guard,
+    safe_execute,
 )
 from plugins.transfer import (
     copy_or_reupload,
@@ -141,9 +144,25 @@ def _resolve_batch_topic(start_ref, end_ref, start_msg, end_msg, source_chat):
     return topic_id
 
 
+def _is_renamable_media(message) -> bool:
+    media = getattr(message, "media", None)
+    name = str(getattr(media, "name", media)).lower()
+    return any(token in name for token in ("photo", "video", "document", "audio", "animation", "voice", "sticker", "video_note"))
+
+
+def _format_filename_template(template: str, number: int, message_id: int, title: str | None) -> str:
+    values = {"n": number, "index": number, "message_id": message_id, "title": title or ""}
+    try:
+        return template.format(**values)
+    except (KeyError, ValueError, IndexError) as exc:
+        raise ValueError(
+            'Invalid --name-template. Supported placeholders: {n}, {index}, {message_id}, {title}.'
+        ) from exc
+
+
 async def _try_album(
     reader, poster, source_msg, chat_id, start_id, end_id, topic_id,
-    target_chat, target_thread, on_stage, already_processed=None,
+    target_chat, target_thread, on_stage, already_processed=None, preferences=None,
 ):
     """Preserve a 2–10 item album where possible; return source IDs consumed."""
     group_id = getattr(source_msg, "media_group_id", None)
@@ -178,6 +197,7 @@ async def _try_album(
             thread_id=target_thread,
             on_stage=on_stage,
             source_chat=chat_id,
+            preferences=preferences,
         )
         if sent:
             return [int(item.id) for item in in_range]
@@ -253,13 +273,62 @@ async def _prepare_range(reader, start_ref, end_ref, range_number):
     }
 
 
-@Client.on_message(filters.command("save") & filters.user(OWNER_ID))
+def _command_tokens(message: Message) -> list[str]:
+    try:
+        tokens = shlex.split(message.text or "")
+    except ValueError as exc:
+        raise ValueError(f"Could not parse quoted arguments: {exc}") from exc
+    return tokens[1:]
+
+
+def _parse_single_options(tokens: list[str], rename_command: bool = False):
+    if not tokens:
+        raise ValueError("A Telegram message link is required.")
+    link = tokens[0]
+    custom_name = None
+    custom_caption = None
+    index = 1
+
+    if rename_command and index < len(tokens) and not tokens[index].startswith("--"):
+        custom_name = " ".join(tokens[index:])
+        index = len(tokens)
+
+    while index < len(tokens):
+        flag = tokens[index]
+        index += 1
+        if flag not in {"--name", "--caption"}:
+            raise ValueError(f"Unknown option: {flag}. Supported: --name, --caption.")
+        if index >= len(tokens):
+            raise ValueError(f"{flag} needs a value.")
+        value = tokens[index]
+        index += 1
+        if flag == "--name":
+            custom_name = value
+        else:
+            custom_caption = value
+
+    if rename_command and not custom_name:
+        raise ValueError('Usage: /rename <telegram_link> "New filename.ext"')
+    return link, custom_name, custom_caption
+
+
+@Client.on_message(filters.command(["save", "rename"]) & filters.user(OWNER_ID))
 async def save_single(client: Client, message: Message):
-    if len(message.command) < 2:
-        await message.reply_text("Usage: /save <telegram_message_link>\nOpen /menu for the button dashboard.")
+    command_name = str((message.command or ["save"])[0]).split("@", 1)[0].lstrip("/").lower()
+    try:
+        link, custom_name, custom_caption = _parse_single_options(
+            _command_tokens(message), rename_command=command_name == "rename"
+        )
+    except ValueError as exc:
+        await message.reply_text(
+            f"❌ {exc}\n\n"
+            'Examples:\n/save <link> --name "Lecture 01.mp4"\n'
+            '/save <link> --caption "Week 1 notes"\n'
+            '/rename <link> "Renamed lecture.mp4"'
+        )
         return
 
-    reference = parse_telegram_message_link(message.command[1])
+    reference = parse_telegram_message_link(link)
     if not reference:
         await message.reply_text("❌ Invalid Telegram message link. Please copy the direct message link.")
         return
@@ -270,7 +339,9 @@ async def save_single(client: Client, message: Message):
         await message.reply_text(f"🎯 {exc}")
         return
 
-    status_msg = await message.reply_text("⏳ Preparing upload...")
+    status_msg = await message.reply_text(
+        f"⏳ Preparing upload{f' as {custom_name}' if custom_name else ''}..."
+    )
 
     async def on_stage(text: str):
         await _edit_status(status_msg, text)
@@ -293,34 +364,85 @@ async def save_single(client: Client, message: Message):
 
         await copy_or_reupload(
             reader, reference.chat_id, source_msg, target_chat,
-            thread_id=target_thread, on_stage=on_stage, sender=poster,
+            thread_id=target_thread,
+            on_stage=on_stage,
+            sender=poster,
+            custom_filename=custom_name,
+            custom_caption=custom_caption,
+            preferences=get_preferences(OWNER_ID),
         )
         await _edit_status(status_msg, "✅ Uploaded successfully to your destination group.")
 
     except UnsupportedMedia as exc:
         await _edit_status(status_msg, f"⚠️ Skipped: {exc}")
     except Exception as exc:  # noqa: BLE001
-        logger.exception("/save failed")
+        logger.exception("/%s failed", command_name)
         await _edit_status(status_msg, f"❌ Upload failed: {_telegram_error_text(exc)}")
 
 
 @Client.on_message(filters.command(["batch", "multibatch"]) & filters.user(OWNER_ID))
 async def save_batch(client: Client, message: Message):
-    """Accept /batch start end, or /multibatch start1 end1 start2 end2 ..."""
-    args = list(message.command[1:])
-    command_name = str(message.command[0]).split("@", 1)[0].lstrip("/").lower()
+    """Accept /batch start end or titled /multibatch range pairs.
 
-    if len(args) < 2 or len(args) % 2:
+    Syntax:
+      /multibatch <start1> <end1> --title "Percentages" --names "File 1.mp4|File 2.pdf" \
+                   <start2> <end2> --title "Profit & Loss" --name-template "P&L {n}"
+    """
+    try:
+        tokens = _command_tokens(message)
+    except ValueError as exc:
+        await message.reply_text(f"❌ {exc}")
+        return
+    command_name = str((message.command or ["batch"])[0]).split("@", 1)[0].lower()
+
+    parsed_specs = []
+    cursor = 0
+    while cursor < len(tokens):
+        if cursor + 1 >= len(tokens) or tokens[cursor].startswith("--"):
+            await message.reply_text(
+                "❌ Each range must begin with two links: start link, then end link."
+            )
+            return
+        start_link, end_link = tokens[cursor], tokens[cursor + 1]
+        cursor += 2
+        metadata = {"title": None, "names": None, "name_template": None, "caption": None}
+        while cursor < len(tokens) and tokens[cursor].startswith("--"):
+            flag = tokens[cursor]
+            cursor += 1
+            if flag not in {"--title", "--names", "--name-template", "--caption"}:
+                await message.reply_text(
+                    f"❌ Unknown option {flag}. Use --title, --names, --name-template or --caption."
+                )
+                return
+            if cursor >= len(tokens) or tokens[cursor].startswith("--"):
+                await message.reply_text(f"❌ {flag} needs a value in quotation marks.")
+                return
+            value = tokens[cursor]
+            cursor += 1
+            key = flag[2:].replace("-", "_")
+            if key == "names":
+                names = [part.strip() for part in value.split("|") if part.strip()]
+                if not names:
+                    await message.reply_text("❌ --names requires filenames separated by |.")
+                    return
+                metadata[key] = names
+            else:
+                metadata[key] = value
+        parsed_specs.append((start_link, end_link, metadata))
+
+    if not parsed_specs:
         await message.reply_text(
-            "Usage:\n"
-            "/batch <first_link> <last_link>\n"
-            "/multibatch <start1> <end1> <start2> <end2> [<start3> <end3> ...]\n\n"
-            f"Provide complete start/end pairs. Maximum: {MAX_BATCH_RANGES} ranges.\n"
-            "The bot processes ranges in the exact order supplied, and messages in each range in ascending order."
+            "Usage:\n/batch <first_link> <last_link> [--title \"Section title\"]\n\n"
+            "/multibatch <start1> <end1> --title \"Topic 1\" "
+            "<start2> <end2> --title \"Topic 2\"\n\n"
+            "Optional per-range options:\n"
+            '--names "File 01.mp4|Notes.pdf"\n'
+            '--name-template "Lecture {n}"\n'
+            '--caption "Custom caption"'
         )
         return
 
-    pairs_count = len(args) // 2
+    pairs_count = len(parsed_specs)
     if pairs_count > MAX_BATCH_RANGES:
         await message.reply_text(f"❌ Too many ranges. Maximum is {MAX_BATCH_RANGES} start/end pairs.")
         return
@@ -329,17 +451,17 @@ async def save_batch(client: Client, message: Message):
         return
 
     parsed_pairs = []
-    for index in range(pairs_count):
-        start_ref = parse_telegram_message_link(args[index * 2])
-        end_ref = parse_telegram_message_link(args[index * 2 + 1])
+    for index, (start_link, end_link, metadata) in enumerate(parsed_specs, start=1):
+        start_ref = parse_telegram_message_link(start_link)
+        end_ref = parse_telegram_message_link(end_link)
         if not start_ref or not end_ref:
-            await message.reply_text(f"❌ Range {index + 1}: one of its Telegram links is invalid.")
+            await message.reply_text(f"❌ Range {index}: one of its Telegram links is invalid.")
             return
-        parsed_pairs.append((start_ref, end_ref))
+        parsed_pairs.append((start_ref, end_ref, metadata))
 
     total_scan_span = sum(
         max(0, end_ref.message_id - start_ref.message_id + 1)
-        for start_ref, end_ref in parsed_pairs
+        for start_ref, end_ref, _metadata in parsed_pairs
     )
     if total_scan_span > MAX_MULTI_SCAN_SPAN:
         await message.reply_text(
@@ -350,7 +472,7 @@ async def save_batch(client: Client, message: Message):
         return
 
     # Validate the link pairs before reserving the job or sending anything.
-    for index, (start_ref, end_ref) in enumerate(parsed_pairs, start=1):
+    for index, (start_ref, end_ref, _metadata) in enumerate(parsed_pairs, start=1):
         if start_ref.chat_id != end_ref.chat_id:
             await message.reply_text(f"❌ Range {index}: both links must be from the same Telegram chat.")
             return
@@ -385,13 +507,14 @@ async def save_batch(client: Client, message: Message):
     try:
         reader = get_userbot(client)
         poster = get_poster(client)
+        preferences = get_preferences(OWNER_ID)
 
         # Preflight all sources, then upload. This avoids starting range 1 only to
         # discover that range 3 is malformed or inaccessible.
         prepared_ranges = []
         peer_checks = set()
 
-        for index, (start_ref, end_ref) in enumerate(parsed_pairs, start=1):
+        for index, (start_ref, end_ref, metadata) in enumerate(parsed_pairs, start=1):
             if cancel_event.is_set():
                 await _edit_status(status_msg, "🛑 Cancelled during preparation; nothing was uploaded.")
                 return
@@ -410,6 +533,26 @@ async def save_batch(client: Client, message: Message):
                 f"IDs: {start_ref.message_id} → {end_ref.message_id}"
             )
             prepared = await _prepare_range(reader, start_ref, end_ref, index)
+            prepared.update(metadata)
+            media_messages = [
+                (mid, item) for mid, item in prepared["messages"]
+                if _is_renamable_media(item)
+            ]
+            if prepared.get("names") is not None and len(prepared["names"]) != len(media_messages):
+                raise ValueError(
+                    f"Range {index}: --names contains {len(prepared['names'])} filename(s), "
+                    f"but the range contains {len(media_messages)} media file(s). Provide one name per file."
+                )
+            if prepared.get("names") and prepared.get("name_template"):
+                raise ValueError(f"Range {index}: use either --names or --name-template, not both.")
+            prepared["filename_by_id"] = {}
+            for media_index, (media_id, _media_message) in enumerate(media_messages, start=1):
+                if prepared.get("names"):
+                    prepared["filename_by_id"][int(media_id)] = prepared["names"][media_index - 1]
+                elif prepared.get("name_template"):
+                    prepared["filename_by_id"][int(media_id)] = _format_filename_template(
+                        prepared["name_template"], media_index, int(media_id), prepared.get("title")
+                    )
             prepared_ranges.append(prepared)
 
         # Remove overlapping duplicates while preserving the order of the
@@ -440,7 +583,7 @@ async def save_batch(client: Client, message: Message):
         ignored_total = sum(item["ignored"] for item in prepared_ranges)
         unavailable_total = sum(item["unavailable"] for item in prepared_ranges)
         summary = "\n".join(
-            f"{item['number']}. Topic {item['topic_id'] or '—'}: {len(item['messages'])} messages"
+            f"{item['number']}. {item.get('title') or ('Topic ' + str(item['topic_id'] or '—'))}: {len(item['messages'])} messages"
             for item in prepared_ranges
         )
 
@@ -475,11 +618,20 @@ async def save_batch(client: Client, message: Message):
             end_id = prepared["end_id"]
             topic_id = prepared["topic_id"]
             messages = prepared["messages"]
+            section_title = (prepared.get("title") or "").strip()
+            if section_title:
+                await safe_execute(
+                    poster.send_message,
+                    chat_id=target_chat,
+                    text=f"📚 {section_title}",
+                    parse_mode=enums.ParseMode.DISABLED,
+                    message_thread_id=target_thread,
+                )
 
             await _edit_status(
                 status_msg,
                 f"📤 Starting range {range_number}/{pairs_count}\n"
-                f"Topic: {topic_id or '—'}\n"
+                f"Section: {section_title or ('Topic ' + str(topic_id or '—'))}\n"
                 f"Messages in this range: {len(messages)}\n"
                 f"Overall uploaded: {success_count}/{selected_total}"
             )
@@ -501,12 +653,17 @@ async def save_batch(client: Client, message: Message):
                     media_group_id = getattr(source_msg, "media_group_id", None)
                     album_key = (str(chat_id), str(media_group_id)) if media_group_id else None
 
-                    if album_key and album_key not in processed_albums:
+                    has_per_file_overrides = bool(
+                        prepared.get("names") or prepared.get("name_template") or prepared.get("caption")
+                        or preferences.get("caption_mode") != "keep" or preferences.get("replace_rules")
+                    )
+                    if album_key and album_key not in processed_albums and not has_per_file_overrides:
                         consumed = await _try_album(
                             reader, poster, source_msg, chat_id,
                             start_id, end_id, topic_id,
                             target_chat, target_thread, on_stage,
                             already_processed=processed_ids,
+                            preferences=preferences,
                         )
                         processed_albums.add(album_key)
 
@@ -526,11 +683,16 @@ async def save_batch(client: Client, message: Message):
                                 )
                             continue
 
+                    custom_filename = prepared.get("filename_by_id", {}).get(int(message_id))
+
                     await copy_or_reupload(
                         reader, chat_id, source_msg, target_chat,
                         thread_id=target_thread,
                         on_stage=on_stage,
                         sender=poster,
+                        custom_filename=custom_filename,
+                        custom_caption=prepared.get("caption"),
+                        preferences=preferences,
                     )
                     success_count += 1
                     attempted_count += 1
