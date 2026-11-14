@@ -87,8 +87,38 @@ async def menu_callback(client: Client, query: CallbackQuery):
             "📚 **BATCH UPLOAD**\n\n"
             "Use two links from the same chat:\n"
             "`/batch <first_link> <last_link>`\n\n"
-            "Maximum: 500 messages per batch. Use `/cancel` to stop an active batch. "
-            "Skipped/unsupported items are included in the final report.",
+            "Maximum: 500 messages per range. Add `--title \"Percentages\"` after a link pair to post a section heading. "
+            "Use `/cancel` to stop an active batch. Skipped/unsupported items are included in the final report.",
+        ),
+        "multibatch": (
+            "🧩 MULTI-BATCH WITH SECTION TITLES\n\n"
+            'Use this format (keep each title in quotes):\n'
+            '<code>/multibatch START1 END1 --title "Percentages" START2 END2 --title "Profit &amp; Loss"</code>\n\n'
+            "Each title is posted automatically before its range.\n\n"
+            'You can also add per-file names: <code>--names "File 1.mp4|File 2.pdf"</code>\n'
+            'Or use an automatic pattern: <code>--name-template "Lecture {n}"</code>.\n'
+            "Use one name for each media item in that range.\n\n"
+            "Optional per-range caption: <code>--caption &quot;Your caption&quot;</code>.",
+        ),
+        "rename": (
+            "✏️ RENAME A FILE\n\n"
+            'Use <code>/rename TELEGRAM_LINK "New filename.mp4"</code>.\n'
+            'Or use <code>/save TELEGRAM_LINK --name "New filename.mp4"</code>.\n\n'
+            "For multi-batch, use <code>--names</code> with filenames separated by |, "
+            'or <code>--name-template "Lecture {n}"</code>. Supported placeholders: {n}, {index}, {message_id}, {title}.'
+        ),
+        "settings": (
+            "⚙️ TRANSFER SETTINGS\n\n"
+            "<code>/settings</code> — view current preferences\n"
+            '<code>/setcaption append "Your caption"</code> — append to source captions\n'
+            '<code>/setcaption replace "Your caption"</code> — replace source captions\n'
+            "<code>/clearcaption</code> — disable custom caption\n"
+            "Reply to a photo with <code>/setthumb</code> to set a custom thumbnail.\n"
+            "<code>/clearthumb</code> clears it.\n"
+            "<code>/setthumbmode source|custom|none</code> selects original, custom or no thumbnail.\n"
+            '<code>/replaceword "old" =&gt; "new"</code> replaces text in filenames/captions.\n'
+            "<code>/clearreplace</code> clears rules.\n"
+            "<code>/setpin on</code> or <code>/setpin off</code> toggles auto-pin."
         ),
         "upload": (
             "📤 **UPLOAD A REPLIED MESSAGE**\n\n"
@@ -135,7 +165,7 @@ async def menu_callback(client: Client, query: CallbackQuery):
     if not page:
         await query.answer("Unknown menu action", show_alert=True)
         return
-    parse_mode = enums.ParseMode.DISABLED if action == "target" else enums.ParseMode.MARKDOWN
+    parse_mode = enums.ParseMode.HTML if action in {"target", "multibatch", "rename", "settings"} else enums.ParseMode.MARKDOWN
     keyboard = target_keyboard(bool(get_target(OWNER_ID))) if action == "target" else back_keyboard()
     await query.message.edit_text(page[0], reply_markup=keyboard, parse_mode=parse_mode)
 
