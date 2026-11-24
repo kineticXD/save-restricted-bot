@@ -30,6 +30,12 @@ CAPTION_LIMIT_FREE = 1024
 CAPTION_LIMIT_PREMIUM = 4096
 FILE_LIMIT_FREE_MB = 2000
 FILE_LIMIT_PREMIUM_MB = 4000
+# Large non-Premium uploads are split into smaller Telegram documents.
+MAX_SPLIT_INPUT_MB = 4000
+STREAM_PART_MAX_MB = 700
+STREAM_PART_MIN_MB = 64
+STREAM_DISK_HEADROOM_MB = 96
+STREAM_CHUNK_BYTES = MB
 
 StageCallback = Optional[Callable[[str], Awaitable[None]]]
 
@@ -578,6 +584,197 @@ async def _send_dice(sender, msg, target_chat, thread_id, preferences=None):
     )
 
 
+
+async def _stream_large_file_as_parts(
+    reader,
+    sender,
+    msg,
+    source_chat,
+    target_chat,
+    thread_id,
+    on_stage,
+    original_filename,
+    caption,
+    preferences=None,
+):
+    """Stream a large source message into disk-sized parts and upload each part.
+
+    Only one part is stored locally at a time. This avoids downloading the full
+    multi-GB source onto Render's ephemeral filesystem or into RAM.
+    """
+    if not hasattr(reader, "stream_media"):
+        raise UnsupportedMedia(
+            "This Kurigram build does not expose stream_media(); update the "
+            "Kurigram dependency before using large-file streaming."
+        )
+
+    media_size = int(getattr(getattr(msg, "document", None), "file_size", 0) or 0)
+    if not media_size:
+        for attr in ("video", "audio", "animation", "photo", "voice", "video_note", "sticker"):
+            obj = getattr(msg, attr, None)
+            media_size = int(getattr(obj, "file_size", 0) or 0)
+            if media_size:
+                break
+    if not media_size:
+        raise UnsupportedMedia("Telegram did not provide the source file size.")
+
+    tmpdir = tempfile.mkdtemp(prefix="waguri_stream_")
+    part_path = os.path.join(tmpdir, "upload_part.bin")
+    total_chunks = (media_size + STREAM_CHUNK_BYTES - 1) // STREAM_CHUNK_BYTES
+    source_message = msg
+    sent_bytes = 0
+    last_stage_bytes = 0
+
+    try:
+        free_bytes = shutil.disk_usage(tmpdir).free
+        headroom = STREAM_DISK_HEADROOM_MB * MB
+        usable_bytes = free_bytes - headroom
+        max_part_bytes = min(STREAM_PART_MAX_MB * MB, usable_bytes)
+        max_part_bytes = (max_part_bytes // STREAM_CHUNK_BYTES) * STREAM_CHUNK_BYTES
+        min_part_bytes = STREAM_PART_MIN_MB * MB
+
+        if max_part_bytes < min_part_bytes:
+            raise UnsupportedMedia(
+                "Render does not currently have enough free temporary disk space "
+                "for even a 64 MB upload part. No data was uploaded. "
+                f"Free space detected: {_fmt_size(free_bytes)}."
+            )
+
+        chunks_per_part = max(1, max_part_bytes // STREAM_CHUNK_BYTES)
+        part_count = (total_chunks + chunks_per_part - 1) // chunks_per_part
+        safe_name = _safe_local_name(original_filename) or "large_file.bin"
+        base, ext = os.path.splitext(safe_name)
+        if not ext:
+            ext = ".bin"
+
+        await _stage(
+            on_stage,
+            f"🧩 Streaming transfer: {part_count} parts, "
+            f"up to {_fmt_size(chunks_per_part * STREAM_CHUNK_BYTES)} each. "
+            f"Render free disk available: {_fmt_size(free_bytes)}."
+        )
+
+        for part_index in range(part_count):
+            chunk_offset = part_index * chunks_per_part
+            chunk_limit = min(chunks_per_part, total_chunks - chunk_offset)
+            expected_part_size = min(
+                media_size - chunk_offset * STREAM_CHUNK_BYTES,
+                chunk_limit * STREAM_CHUNK_BYTES,
+            )
+            part_number = part_index + 1
+            part_name = f"{base}.part{part_number:03d}-of-{part_count:03d}{ext}"
+            await _stage(
+                on_stage,
+                f"⬇️ Streaming part {part_number}/{part_count} "
+                f"({_fmt_size(expected_part_size)})..."
+            )
+
+            downloaded = 0
+            last_part_stage = 0
+            refreshed_once = False
+            while True:
+                downloaded = 0
+                try:
+                    with open(part_path, "wb") as output:
+                        async for block in reader.stream_media(
+                            source_message,
+                            offset=chunk_offset,
+                            limit=chunk_limit,
+                        ):
+                            if not block:
+                                continue
+                            output.write(block)
+                            downloaded += len(block)
+
+                            if downloaded - last_part_stage >= 64 * MB:
+                                last_part_stage = downloaded
+                                await _stage(
+                                    on_stage,
+                                    f"⬇️ Part {part_number}/{part_count}: "
+                                    f"{_fmt_size(downloaded)} / {_fmt_size(expected_part_size)}"
+                                )
+                    break
+                except Exception as exc:  # noqa: BLE001
+                    try:
+                        os.remove(part_path)
+                    except OSError:
+                        pass
+                    if not refreshed_once and _is_file_reference_error(exc):
+                        refreshed_once = True
+                        refreshed = await _refresh_source_message(
+                            reader, source_chat, getattr(msg, "id", None)
+                        )
+                        if refreshed is not None:
+                            source_message = refreshed
+                            continue
+                    raise
+
+            if downloaded != expected_part_size:
+                raise RuntimeError(
+                    f"Part {part_number} download was incomplete: "
+                    f"{_fmt_size(downloaded)} received, "
+                    f"{_fmt_size(expected_part_size)} expected."
+                )
+
+            if os.path.getsize(part_path) != expected_part_size:
+                raise RuntimeError(f"Part {part_number} failed its local size check.")
+
+            part_caption = (
+                f"📦 Original file: {safe_name}\n"
+                f"Part {part_number}/{part_count}\n"
+                "Download all parts, then join them in order to restore the original file."
+            )
+            if part_number == 1 and caption:
+                part_caption += f"\n\nOriginal caption:\n{caption}"
+            part_caption = part_caption[:CAPTION_LIMIT_FREE]
+
+            kwargs = {
+                "chat_id": target_chat,
+                "document": part_path,
+                "file_name": part_name,
+                "force_document": True,
+                "caption": part_caption,
+                "parse_mode": enums.ParseMode.DISABLED,
+                "message_thread_id": thread_id,
+            }
+            progress = _progress_cb(
+                on_stage, f"⬆️ Uploading part {part_number}/{part_count}"
+            )
+            if progress and _supports_parameter(sender.send_document, "progress"):
+                kwargs["progress"] = progress
+
+            await _stage(
+                on_stage,
+                f"⬆️ Uploading part {part_number}/{part_count} "
+                f"({_fmt_size(expected_part_size)})..."
+            )
+            await _send_result(
+                sender, "send_document", target_chat, preferences, **kwargs
+            )
+            sent_bytes += expected_part_size
+
+            try:
+                os.remove(part_path)
+            except OSError:
+                pass
+
+        if sent_bytes != media_size:
+            raise RuntimeError(
+                f"Streaming transfer ended at {_fmt_size(sent_bytes)}; "
+                f"source size was {_fmt_size(media_size)}."
+            )
+
+        await _stage(
+            on_stage,
+            f"✅ Split transfer complete: {part_count} parts uploaded "
+            f"({_fmt_size(sent_bytes)} total)."
+        )
+
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+
 async def _reupload_file(
     reader,
     sender,
@@ -597,12 +794,49 @@ async def _reupload_file(
     kind = getattr(media_type, "name", str(media_type)).lower().replace("_", " ")
     premium = await _is_premium(sender)
 
-    limit_mb = FILE_LIMIT_PREMIUM_MB if premium else FILE_LIMIT_FREE_MB
+    split_required = bool(size > FILE_LIMIT_FREE_MB * MB and not premium)
+    limit_mb = FILE_LIMIT_PREMIUM_MB if premium else (
+        MAX_SPLIT_INPUT_MB if split_required else FILE_LIMIT_FREE_MB
+    )
     if MAX_FILE_MB:
         limit_mb = min(limit_mb, MAX_FILE_MB)
 
     if size and size > limit_mb * MB:
-        raise UnsupportedMedia(f"{kind} is {_fmt_size(size)}; limit is {limit_mb} MB.")
+        raise UnsupportedMedia(
+            f"{kind} is {_fmt_size(size)}; configured transfer ceiling is {limit_mb} MB."
+        )
+
+    # On Render Free, do not stage the entire multi-GB source file. Stream it
+    # from Telegram in bounded chunks and upload one temporary part at a time.
+    if split_required:
+        original_name = getattr(media, "file_name", None)
+        upload_name = _choose_filename(original_name, custom_filename, preferences)
+        source_caption = getattr(msg, "caption", None) or None
+        caption = source_caption
+        if custom_caption is not None:
+            caption = custom_caption or None
+        elif preferences:
+            mode = preferences.get("caption_mode", "keep")
+            pref_caption = (preferences.get("caption_text") or "").strip()
+            if mode == "replace" and pref_caption:
+                caption = pref_caption
+            elif mode == "append" and pref_caption:
+                caption = f"{source_caption or ''}\\n\\n{pref_caption}".strip()
+        caption = _replace_words(caption, preferences)
+        async with _transfer_lock:
+            await _stream_large_file_as_parts(
+                reader=reader,
+                sender=sender,
+                msg=msg,
+                source_chat=source_chat,
+                target_chat=target_chat,
+                thread_id=thread_id,
+                on_stage=on_stage,
+                original_filename=upload_name or original_name,
+                caption=caption,
+                preferences=preferences,
+            )
+        return
 
     tmpdir = tempfile.mkdtemp(prefix="save_")
 
