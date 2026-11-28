@@ -7,7 +7,13 @@ from pyrogram import Client, filters, enums
 from pyrogram.types import Message
 
 from config import OWNER_ID
-from storage import get_preferences
+from storage import (
+    get_preferences,
+    record_transfer_stats,
+    save_batch_checkpoint,
+    get_batch_checkpoint,
+    clear_batch_checkpoint,
+)
 from plugins.helpers import (
     parse_telegram_message_link,
     message_belongs_to_topic,
@@ -20,6 +26,7 @@ from plugins.helpers import (
 from plugins.transfer import (
     copy_or_reupload,
     reupload_media_group,
+    estimate_message_bytes,
     UnsupportedMedia,
 )
 
@@ -32,6 +39,54 @@ MAX_MULTI_SCAN_SPAN = 50_000       # total ID span across all ranges
 MAX_MULTI_MESSAGES = 2_000        # total selected messages across all ranges
 FETCH_CHUNK = 100
 active_jobs = {}
+pause_events: dict[int, asyncio.Event] = {}
+
+VALID_MEDIA_KINDS = {
+    "photo", "video", "document", "audio", "voice",
+    "animation", "sticker", "video_note", "text", "poll", "other",
+}
+
+
+def classify_message_kind(message) -> str:
+    """Return a normalized media-kind tag for --only / --skip filtering."""
+    media = getattr(message, "media", None)
+    if media is not None:
+        name = str(getattr(media, "name", media)).lower()
+        if "." in name:
+            name = name.rsplit(".", 1)[-1]
+        if name == "web_page":
+            return "text"
+        if name in VALID_MEDIA_KINDS:
+            return name
+        return "other"
+    if getattr(message, "text", None):
+        return "text"
+    return "other"
+
+
+def _parse_kind_list(raw: str) -> set[str]:
+    aliases = {"pdf": "document", "doc": "document", "docs": "document", "videos": "video", "photos": "photo", "gif": "animation", "stickers": "sticker"}
+    kinds = set()
+    for token in str(raw or "").split(","):
+        k = token.strip().lower()
+        if not k:
+            continue
+        k = aliases.get(k, k)
+        if k not in VALID_MEDIA_KINDS:
+            raise ValueError(
+                f"Unknown media type '{token.strip()}'. Supported: {', '.join(sorted(VALID_MEDIA_KINDS))}."
+            )
+        kinds.add(k)
+    return kinds
+
+
+def message_matches_filter(message, only_kinds: set[str] | None = None, skip_kinds: set[str] | None = None) -> bool:
+    kind = classify_message_kind(message)
+    if only_kinds and kind not in only_kinds:
+        return False
+    if skip_kinds and kind in skip_kinds:
+        return False
+    return True
 
 
 def get_userbot(client: Client) -> Client:
@@ -405,13 +460,13 @@ async def save_batch(client: Client, message: Message):
             return
         start_link, end_link = tokens[cursor], tokens[cursor + 1]
         cursor += 2
-        metadata = {"title": None, "names": None, "name_template": None, "caption": None}
+        metadata = {"title": None, "names": None, "name_template": None, "caption": None, "only": None, "skip": None}
         while cursor < len(tokens) and tokens[cursor].startswith("--"):
             flag = tokens[cursor]
             cursor += 1
-            if flag not in {"--title", "--names", "--name-template", "--caption"}:
+            if flag not in {"--title", "--names", "--name-template", "--caption", "--only", "--skip"}:
                 await message.reply_text(
-                    f"❌ Unknown option {flag}. Use --title, --names, --name-template or --caption."
+                    f"❌ Unknown option {flag}. Use --title, --names, --name-template, --caption, --only or --skip."
                 )
                 return
             if cursor >= len(tokens) or tokens[cursor].startswith("--"):
@@ -426,6 +481,12 @@ async def save_batch(client: Client, message: Message):
                     await message.reply_text("❌ --names requires filenames separated by |.")
                     return
                 metadata[key] = names
+            elif key in {"only", "skip"}:
+                try:
+                    metadata[key] = sorted(_parse_kind_list(value))
+                except ValueError as exc:
+                    await message.reply_text(f"❌ {exc}")
+                    return
             else:
                 metadata[key] = value
         parsed_specs.append((start_link, end_link, metadata))
@@ -496,8 +557,44 @@ async def save_batch(client: Client, message: Message):
         await message.reply_text("⚠️ A batch is already running. Use /cancel to stop it first.")
         return
 
+    raw_specs_for_checkpoint = [
+        {
+            "start_link": s_link,
+            "end_link": e_link,
+            "metadata": meta,
+        }
+        for s_link, e_link, meta in parsed_specs
+    ]
+    await _execute_batch_job(
+        client=client,
+        message=message,
+        parsed_pairs=parsed_pairs,
+        raw_specs=raw_specs_for_checkpoint,
+        target_chat=target_chat,
+        target_thread=target_thread,
+        resume_after_id=0,
+        initial_success=0,
+    )
+
+
+async def _execute_batch_job(
+    *,
+    client: Client,
+    message: Message,
+    parsed_pairs: list,
+    raw_specs: list[dict],
+    target_chat,
+    target_thread,
+    resume_after_id: int = 0,
+    initial_success: int = 0,
+) -> None:
+    owner_key = int(OWNER_ID)
+    pairs_count = len(parsed_pairs)
     cancel_event = asyncio.Event()
+    pause_event = asyncio.Event()
+    pause_event.set()
     active_jobs[owner_key] = cancel_event
+    pause_events[owner_key] = pause_event
     status_msg = await message.reply_text(
         f"⏳ Preparing {pairs_count} range(s)...\n"
         f"Combined ID scan span: {total_scan_span:,}\n"
@@ -532,6 +629,9 @@ async def save_batch(client: Client, message: Message):
                 f"Source chat: {start_ref.chat_id}\n"
                 f"IDs: {start_ref.message_id} → {end_ref.message_id}"
             )
+            default_only = _parse_kind_list(preferences.get('media_filter', '')) if preferences.get('media_filter') else None
+            only_kinds = set(metadata.get('only') or []) or default_only
+            skip_kinds = set(metadata.get('skip') or []) or None
             prepared = await _prepare_range(reader, start_ref, end_ref, index)
             prepared.update(metadata)
             media_messages = [
@@ -545,6 +645,16 @@ async def save_batch(client: Client, message: Message):
                 )
             if prepared.get("names") and prepared.get("name_template"):
                 raise ValueError(f"Range {index}: use either --names or --name-template, not both.")
+            if only_kinds or skip_kinds:
+                prepared["messages"] = [
+                    (mid, smsg) for mid, smsg in prepared["messages"]
+                    if message_matches_filter(smsg, only_kinds, skip_kinds)
+                ]
+            if resume_after_id:
+                prepared["messages"] = [
+                    (mid, smsg) for mid, smsg in prepared["messages"]
+                    if int(mid) > int(resume_after_id)
+                ]
             prepared["filename_by_id"] = {}
             for media_index, (media_id, _media_message) in enumerate(media_messages, start=1):
                 if prepared.get("names"):
@@ -597,7 +707,14 @@ async def save_batch(client: Client, message: Message):
             f"Upload order:\n{summary}\n\nStarting uploads in the supplied range order..."
         )
 
-        success_count = 0
+        success_count = int(initial_success)
+        last_range_idx = 0
+        last_msg_id = int(resume_after_id or 0)
+        save_batch_checkpoint(
+            owner_key, status="active", specs=raw_specs,
+            last_range_index=0, last_message_id=last_msg_id,
+            success_count=success_count, total_count=selected_total + int(initial_success),
+        )
         errors = []
         cancelled = False
         processed_ids = set()
@@ -637,6 +754,13 @@ async def save_batch(client: Client, message: Message):
             )
 
             for position, (message_id, source_msg) in enumerate(messages, start=1):
+                if not pause_event.is_set():
+                    save_batch_checkpoint(
+                        owner_key, status="paused", specs=raw_specs,
+                        last_range_index=range_number - 1, last_message_id=last_msg_id,
+                        success_count=success_count, total_count=selected_total + int(initial_success),
+                    )
+                    await pause_event.wait()
                 if cancel_event.is_set():
                     cancelled = True
                     break
@@ -697,6 +821,14 @@ async def save_batch(client: Client, message: Message):
                     success_count += 1
                     attempted_count += 1
                     processed_ids.add(global_key)
+                    last_msg_id = int(message_id)
+                    record_transfer_stats(owner_key, files=1, bytes_transferred=estimate_message_bytes(source_msg))
+                    if position % 5 == 0:
+                        save_batch_checkpoint(
+                            owner_key, status="active", specs=raw_specs,
+                            last_range_index=range_number - 1, last_message_id=last_msg_id,
+                            success_count=success_count, total_count=selected_total + int(initial_success),
+                        )
 
                 except UnsupportedMedia as exc:
                     errors.append(f"Range {range_number}, message {message_id}: skipped — {exc}")
@@ -741,6 +873,15 @@ async def save_batch(client: Client, message: Message):
             if len(errors) > 5:
                 result += f"\n• ...and {len(errors) - 5} more."
 
+        record_transfer_stats(owner_key, failed=len(errors), batches=1)
+        if cancelled:
+            save_batch_checkpoint(
+                owner_key, status="cancelled", specs=raw_specs,
+                last_range_index=last_range_idx, last_message_id=last_msg_id,
+                success_count=success_count, total_count=selected_total + int(initial_success),
+            )
+        else:
+            clear_batch_checkpoint(owner_key)
         await _edit_status(status_msg, result)
 
     except Exception as exc:  # noqa: BLE001
@@ -749,6 +890,7 @@ async def save_batch(client: Client, message: Message):
 
     finally:
         active_jobs.pop(owner_key, None)
+        pause_events.pop(owner_key, None)
 
 
 @Client.on_message(filters.command("cancel") & filters.user(OWNER_ID))
@@ -760,4 +902,70 @@ async def cancel_batch(client: Client, message: Message):
     event.set()
     await message.reply_text(
         "🛑 Cancellation requested. The current upload will finish, then the batch will stop."
+    )
+
+
+@Client.on_message(filters.command("pause") & filters.user(OWNER_ID))
+async def pause_batch(client: Client, message: Message):
+    owner_key = int(OWNER_ID)
+    if owner_key not in active_jobs:
+        await message.reply_text("There is no active batch to pause.")
+        return
+    pe = pause_events.get(owner_key)
+    if pe and not pe.is_set():
+        await message.reply_text("⏸ The active batch is already paused. Use /resume to continue.")
+        return
+    if pe:
+        pe.clear()
+    await message.reply_text("⏸ Batch paused after the current file finishes. Use /resume to continue or /cancel to stop.")
+
+
+@Client.on_message(filters.command("resume") & filters.user(OWNER_ID))
+async def resume_batch(client: Client, message: Message):
+    owner_key = int(OWNER_ID)
+    if owner_key in active_jobs:
+        pe = pause_events.get(owner_key)
+        if pe and not pe.is_set():
+            pe.set()
+            await message.reply_text("▶️ Batch resumed.")
+        else:
+            await message.reply_text("▶️ The active batch is already running.")
+        return
+
+    checkpoint = get_batch_checkpoint(owner_key)
+    if not checkpoint or not checkpoint.get("specs"):
+        await message.reply_text("No paused or interrupted batch found to resume.")
+        return
+
+    try:
+        target_chat, target_thread = await _destination(client, message)
+    except LookupError as exc:
+        await message.reply_text(f"🎯 {exc}")
+        return
+
+    specs = checkpoint["specs"]
+    parsed_pairs = []
+    for item in specs:
+        s_ref = parse_telegram_message_link(item["start_link"])
+        e_ref = parse_telegram_message_link(item["end_link"])
+        if s_ref and e_ref:
+            parsed_pairs.append((s_ref, e_ref, item.get("metadata") or {}))
+    if not parsed_pairs:
+        clear_batch_checkpoint(owner_key)
+        await message.reply_text("❌ Saved checkpoint links are invalid; checkpoint cleared.")
+        return
+
+    await message.reply_text(
+        f"🔄 Resuming batch from message ID > {checkpoint.get('last_message_id', 0)} "
+        f"({checkpoint.get('success_count', 0)} already uploaded)..."
+    )
+    await _execute_batch_job(
+        client=client,
+        message=message,
+        parsed_pairs=parsed_pairs,
+        raw_specs=specs,
+        target_chat=target_chat,
+        target_thread=target_thread,
+        resume_after_id=int(checkpoint.get("last_message_id") or 0),
+        initial_success=int(checkpoint.get("success_count") or 0),
     )

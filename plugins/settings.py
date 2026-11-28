@@ -52,7 +52,8 @@ async def settings_command(client: Client, message: Message):
         f"Custom thumbnail: {thumb}\n"
         f"Thumbnail mode: {prefs.get('thumb_mode', 'source')}\n"
         f"Auto-pin uploads: {'ON ✅' if prefs.get('auto_pin') else 'OFF'}\n"
-        f"Word replacement rules: {len(rules)}\n\n"
+        f"Word replacement rules: {len(rules)}\n"
+        f"Default media filter: {prefs.get('media_filter') or 'All media'}\n\n"
         "Use /help for commands and examples."
     )
     await message.reply_text(text)
@@ -225,3 +226,26 @@ async def set_thumbnail_mode_command(client: Client, message: Message):
         return
     update_preference(OWNER_ID, "thumb_mode", mode)
     await message.reply_text(f"✅ Thumbnail mode set to: {mode}.")
+
+
+@Client.on_message(filters.command("setfilter") & filters.user(OWNER_ID))
+async def set_filter_command(client: Client, message: Message):
+    from plugins.save import _parse_kind_list
+    raw = (message.text or "").partition(" ")[2].strip()
+    if not raw:
+        await message.reply_text(
+            "Usage: /setfilter video,document  (or /setfilter all to clear)\n"
+            "Supported types: photo, video, document, audio, voice, animation, sticker, video_note, text, poll"
+        )
+        return
+    if raw.lower() in {"all", "none", "clear", "off"}:
+        update_preference(OWNER_ID, "media_filter", "")
+        await message.reply_text("✅ Media filter cleared. All message types will be transferred.")
+        return
+    try:
+        kinds = sorted(_parse_kind_list(raw))
+    except ValueError as exc:
+        await message.reply_text(f"❌ {exc}")
+        return
+    update_preference(OWNER_ID, "media_filter", ",".join(kinds))
+    await message.reply_text(f"✅ Default media filter saved: {', '.join(kinds)}")

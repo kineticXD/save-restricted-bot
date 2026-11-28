@@ -237,8 +237,20 @@ def _progress_cb(on_stage: StageCallback, label: str, interval: float = 2.5):
     if not on_stage:
         return None
 
-    state = {"last": 0.0, "pct": -1}
+    state = {"last": 0.0, "pct": -1, "start": time.monotonic()}
     lock = asyncio.Lock()
+
+    def _fmt_eta(seconds: float) -> str:
+        if seconds <= 0 or seconds > 86400 * 7:
+            return "--"
+        secs = int(round(seconds))
+        if secs < 60:
+            return f"{secs}s"
+        mins, rem = divmod(secs, 60)
+        if mins < 60:
+            return f"{mins}m {rem}s"
+        hrs, mins = divmod(mins, 60)
+        return f"{hrs}h {mins}m"
 
     async def callback(current, total, *_extra):
         try:
@@ -270,9 +282,14 @@ def _progress_cb(on_stage: StageCallback, label: str, interval: float = 2.5):
             state["last"] = now
             state["pct"] = percent
 
+            elapsed = max(0.001, now - state["start"])
+            speed = current / elapsed
+            speed_str = f"{_fmt_size(speed)}/s"
+            eta_str = "Done" if finished else f"ETA {_fmt_eta((total - current) / speed) if speed > 0 else '--'}"
+
             await _stage(
                 on_stage,
-                f"{label}\n[{bar}] {percent}%\n{_fmt_size(current)} / {_fmt_size(total)}",
+                f"{label}\n[{bar}] {percent}%\n{_fmt_size(current)} / {_fmt_size(total)} · {speed_str} · {eta_str}",
             )
 
     return callback
@@ -672,6 +689,7 @@ async def _stream_large_file_as_parts(
             downloaded = 0
             last_part_stage = 0
             refreshed_once = False
+            flood_retries = 0
             while True:
                 downloaded = 0
                 try:
@@ -694,6 +712,17 @@ async def _stream_large_file_as_parts(
                                     f"{_fmt_size(downloaded)} / {_fmt_size(expected_part_size)}"
                                 )
                     break
+                except FloodWait as exc:
+                    try:
+                        os.remove(part_path)
+                    except OSError:
+                        pass
+                    if flood_retries >= 3 or exc.value > 300:
+                        raise
+                    flood_retries += 1
+                    logger.warning("FloodWait %ss during stream part %s; retry %s", exc.value, part_number, flood_retries)
+                    await asyncio.sleep(exc.value + 1)
+                    continue
                 except Exception as exc:  # noqa: BLE001
                     try:
                         os.remove(part_path)
@@ -821,7 +850,7 @@ async def _reupload_file(
             if mode == "replace" and pref_caption:
                 caption = pref_caption
             elif mode == "append" and pref_caption:
-                caption = f"{source_caption or ''}\\n\\n{pref_caption}".strip()
+                caption = f"{source_caption or ''}\n\n{pref_caption}".strip()
         caption = _replace_words(caption, preferences)
         async with _transfer_lock:
             await _stream_large_file_as_parts(
@@ -1351,3 +1380,17 @@ async def copy_or_reupload(
     )
 
     return "reuploaded"
+
+
+def estimate_message_bytes(msg) -> int:
+    """Return the media file_size in bytes if present, else text length."""
+    for attr in ("document", "video", "audio", "animation", "voice", "video_note", "sticker"):
+        obj = getattr(msg, attr, None)
+        size = int(getattr(obj, "file_size", 0) or 0)
+        if size > 0:
+            return size
+    photo = getattr(msg, "photo", None)
+    if photo is not None:
+        return int(getattr(photo, "file_size", 0) or 0)
+    text = getattr(msg, "text", None) or getattr(msg, "caption", None) or ""
+    return len(str(text).encode("utf-8"))

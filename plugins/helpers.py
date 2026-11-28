@@ -49,6 +49,13 @@ class SafetyGuard:
                 return False
         return True
 
+    def reset(self) -> None:
+        self.circuit_open = False
+        self.flood_count = 0
+        self.circuit_until = None
+        self.flood_reset_time = datetime.now()
+        logger.info("Safety circuit manually RESET.")
+
 
 guard = SafetyGuard()
 
@@ -62,7 +69,7 @@ async def safe_execute(func, *args, **kwargs):
     if not guard.check_circuit():
         raise RuntimeError("Safety circuit is open. Please wait before sending again.")
 
-    for attempt in range(2):
+    for attempt in range(3):
         try:
             result = await func(*args, **kwargs)
             await safe_delay()

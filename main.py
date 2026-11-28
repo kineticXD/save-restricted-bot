@@ -135,6 +135,10 @@ async def register_bot_commands(bot):
         BotCommand("clearreplace", "Clear all replacement rules"),
         BotCommand("setpin", "Enable or disable auto-pin"),
         BotCommand("stats", "Show transfer and safety status"),
+        BotCommand("pause", "Pause the active batch"),
+        BotCommand("resume", "Resume a paused or interrupted batch"),
+        BotCommand("setfilter", "Filter media types for batches"),
+        BotCommand("resetguard", "Reset the FloodWait safety circuit"),
         BotCommand("cancel", "Cancel the active batch"),
     ]
     try:

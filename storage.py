@@ -18,6 +18,7 @@ DEFAULT_PREFERENCES = {
     "thumb_mode": "source",    # source | custom | none
     "auto_pin": 0,
     "replace_rules": [],
+    "media_filter": "",
 }
 
 
@@ -76,6 +77,32 @@ def init_storage() -> None:
             db.execute(
                 "ALTER TABLE transfer_preferences ADD COLUMN thumb_mode TEXT NOT NULL DEFAULT 'source'"
             )
+        if "media_filter" not in existing_columns:
+            db.execute(
+                "ALTER TABLE transfer_preferences ADD COLUMN media_filter TEXT NOT NULL DEFAULT ''"
+            )
+        db.execute(
+            """CREATE TABLE IF NOT EXISTS transfer_stats (
+                owner_id INTEGER PRIMARY KEY,
+                total_files INTEGER NOT NULL DEFAULT 0,
+                total_bytes INTEGER NOT NULL DEFAULT 0,
+                failed_items INTEGER NOT NULL DEFAULT 0,
+                total_batches INTEGER NOT NULL DEFAULT 0,
+                updated_at TEXT NOT NULL
+            )"""
+        )
+        db.execute(
+            """CREATE TABLE IF NOT EXISTS batch_checkpoints (
+                owner_id INTEGER PRIMARY KEY,
+                status TEXT NOT NULL DEFAULT 'active',
+                specs_json TEXT NOT NULL DEFAULT '[]',
+                last_range_index INTEGER NOT NULL DEFAULT 0,
+                last_message_id INTEGER NOT NULL DEFAULT 0,
+                success_count INTEGER NOT NULL DEFAULT 0,
+                total_count INTEGER NOT NULL DEFAULT 0,
+                updated_at TEXT NOT NULL
+            )"""
+        )
 
 
 def set_target(
@@ -154,6 +181,9 @@ def update_preference(owner_id: int, key: str, value) -> None:
         raise ValueError("thumb_mode must be source, custom or none")
     if key == "auto_pin":
         value = 1 if bool(value) else 0
+    if key == "media_filter":
+        tokens = [t.strip().lower() for t in str(value or "").split(",") if t.strip()]
+        value = ",".join(dict.fromkeys(tokens))
     if key == "replace_rules":
         value = json.dumps(value or [], ensure_ascii=False)
     if value is None:
@@ -169,3 +199,106 @@ def update_preference(owner_id: int, key: str, value) -> None:
             f"UPDATE transfer_preferences SET {key} = ?, updated_at = ? WHERE owner_id = ?",
             (value, datetime.now(timezone.utc).isoformat(), int(owner_id)),
         )
+
+
+def record_transfer_stats(
+    owner_id: int,
+    files: int = 0,
+    bytes_transferred: int = 0,
+    failed: int = 0,
+    batches: int = 0,
+) -> None:
+    init_storage()
+    now = datetime.now(timezone.utc).isoformat()
+    with _database() as db:
+        db.execute(
+            """INSERT INTO transfer_stats
+               (owner_id, total_files, total_bytes, failed_items, total_batches, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?)
+               ON CONFLICT(owner_id) DO UPDATE SET
+                 total_files = total_files + excluded.total_files,
+                 total_bytes = total_bytes + excluded.total_bytes,
+                 failed_items = failed_items + excluded.failed_items,
+                 total_batches = total_batches + excluded.total_batches,
+                 updated_at = excluded.updated_at""",
+            (int(owner_id), int(files), int(bytes_transferred), int(failed), int(batches), now),
+        )
+
+
+def get_transfer_stats(owner_id: int) -> dict:
+    init_storage()
+    with _database() as db:
+        row = db.execute(
+            "SELECT * FROM transfer_stats WHERE owner_id = ?", (int(owner_id),)
+        ).fetchone()
+    if not row:
+        return {
+            "total_files": 0,
+            "total_bytes": 0,
+            "failed_items": 0,
+            "total_batches": 0,
+            "updated_at": None,
+        }
+    return dict(row)
+
+
+def save_batch_checkpoint(
+    owner_id: int,
+    *,
+    status: str,
+    specs: list[dict],
+    last_range_index: int,
+    last_message_id: int,
+    success_count: int,
+    total_count: int,
+) -> None:
+    init_storage()
+    now = datetime.now(timezone.utc).isoformat()
+    with _database() as db:
+        db.execute(
+            """INSERT INTO batch_checkpoints
+               (owner_id, status, specs_json, last_range_index, last_message_id,
+                success_count, total_count, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(owner_id) DO UPDATE SET
+                 status = excluded.status,
+                 specs_json = excluded.specs_json,
+                 last_range_index = excluded.last_range_index,
+                 last_message_id = excluded.last_message_id,
+                 success_count = excluded.success_count,
+                 total_count = excluded.total_count,
+                 updated_at = excluded.updated_at""",
+            (
+                int(owner_id),
+                str(status),
+                json.dumps(specs, ensure_ascii=False),
+                int(last_range_index),
+                int(last_message_id),
+                int(success_count),
+                int(total_count),
+                now,
+            ),
+        )
+
+
+def get_batch_checkpoint(owner_id: int) -> Optional[dict]:
+    init_storage()
+    with _database() as db:
+        row = db.execute(
+            "SELECT * FROM batch_checkpoints WHERE owner_id = ?", (int(owner_id),)
+        ).fetchone()
+    if not row:
+        return None
+    data = dict(row)
+    try:
+        data["specs"] = json.loads(data.get("specs_json") or "[]")
+    except (TypeError, ValueError):
+        data["specs"] = []
+    return data
+
+
+def clear_batch_checkpoint(owner_id: int) -> bool:
+    init_storage()
+    with _database() as db:
+        cur = db.execute("DELETE FROM batch_checkpoints WHERE owner_id = ?", (int(owner_id),))
+        return cur.rowcount > 0
