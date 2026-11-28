@@ -27,6 +27,7 @@ from plugins.transfer import (
     copy_or_reupload,
     reupload_media_group,
     estimate_message_bytes,
+    _fmt_size,
     UnsupportedMedia,
 )
 
@@ -128,7 +129,9 @@ async def _destination(client, message):
     return await get_destination(message, OWNER_ID)
 
 
-async def _edit_status(status_message: Message, text: str):
+async def _edit_status(status_message: Message | None, text: str):
+    if status_message is None:
+        return
     """Status edits are best-effort and must not stop a transfer."""
     try:
         await status_message.edit_text(text, parse_mode=enums.ParseMode.DISABLED)
@@ -595,13 +598,18 @@ async def _execute_batch_job(
     pause_event.set()
     active_jobs[owner_key] = cancel_event
     pause_events[owner_key] = pause_event
-    status_msg = await message.reply_text(
-        f"⏳ Preparing {pairs_count} range(s)...\n"
-        f"Combined ID scan span: {total_scan_span:,}\n"
-        "No uploads will start until every range has been checked."
+    total_scan_span = sum(
+        max(0, end_ref.message_id - start_ref.message_id + 1)
+        for start_ref, end_ref, _metadata in parsed_pairs
     )
+    status_msg = None
 
     try:
+        status_msg = await message.reply_text(
+            f"⏳ Preparing {pairs_count} range(s)...\n"
+            f"Combined ID scan span: {total_scan_span:,}\n"
+            "No uploads will start until every range has been checked."
+        )
         reader = get_userbot(client)
         poster = get_poster(client)
         preferences = get_preferences(OWNER_ID)
@@ -720,9 +728,21 @@ async def _execute_batch_job(
         processed_ids = set()
         processed_albums = set()
         attempted_count = 0
+        batch_bytes = 0
+        batch_state = {"range_num": 1, "pos": 0, "range_total": 0}
+
+        def _batch_header() -> str:
+            total_all = selected_total + int(initial_success)
+            pct = min(100, int((success_count * 100) / total_all)) if total_all > 0 else 0
+            filled = max(0, min(10, pct // 10))
+            bar = "█" * filled + "░" * (10 - filled)
+            return (
+                f"📦 Batch [{bar}] {pct}% ({success_count}/{total_all} files · {_fmt_size(batch_bytes)})\n"
+                f"📂 Range {batch_state['range_num']}/{pairs_count} ({batch_state['pos']}/{batch_state['range_total']}) · Issues: {len(errors)}"
+            )
 
         async def on_stage(text: str):
-            await _edit_status(status_msg, text)
+            await _edit_status(status_msg, f"{_batch_header()}\n\n{text}\n\nUse /pause or /cancel.")
 
         for prepared in prepared_ranges:
             if cancel_event.is_set():
@@ -753,7 +773,10 @@ async def _execute_batch_job(
                 f"Overall uploaded: {success_count}/{selected_total}"
             )
 
+            batch_state['range_num'] = range_number
+            batch_state['range_total'] = len(messages)
             for position, (message_id, source_msg) in enumerate(messages, start=1):
+                batch_state['pos'] = position
                 if not pause_event.is_set():
                     save_batch_checkpoint(
                         owner_key, status="paused", specs=raw_specs,
@@ -797,14 +820,10 @@ async def _execute_batch_job(
                             success_count += len(consumed)
                             attempted_count += len(consumed)
 
-                            if position % 5 == 0 or position == len(messages):
-                                await _edit_status(
-                                    status_msg,
-                                    f"📤 Uploading range {range_number}/{pairs_count}\n"
-                                    f"Range progress: {position}/{len(messages)}\n"
-                                    f"Overall uploaded: {success_count}/{selected_total}\n"
-                                    f"Issues: {len(errors)}\nUse /cancel to stop."
-                                )
+                            await _edit_status(
+                                status_msg,
+                                f"{_batch_header()}\n\n✅ Album uploaded ({len(consumed)} items).\n\nUse /pause or /cancel."
+                            )
                             continue
 
                     custom_filename = prepared.get("filename_by_id", {}).get(int(message_id))
@@ -822,7 +841,9 @@ async def _execute_batch_job(
                     attempted_count += 1
                     processed_ids.add(global_key)
                     last_msg_id = int(message_id)
-                    record_transfer_stats(owner_key, files=1, bytes_transferred=estimate_message_bytes(source_msg))
+                    item_bytes = estimate_message_bytes(source_msg)
+                    batch_bytes += item_bytes
+                    record_transfer_stats(owner_key, files=1, bytes_transferred=item_bytes)
                     if position % 5 == 0:
                         save_batch_checkpoint(
                             owner_key, status="active", specs=raw_specs,
@@ -845,14 +866,10 @@ async def _execute_batch_job(
                         cancelled = True
                         break
 
-                if position % 5 == 0 or position == len(messages):
-                    await _edit_status(
-                        status_msg,
-                        f"📤 Uploading range {range_number}/{pairs_count}\n"
-                        f"Range progress: {position}/{len(messages)}\n"
-                        f"Overall uploaded: {success_count}/{selected_total}\n"
-                        f"Issues: {len(errors)}\nUse /cancel to stop."
-                    )
+                await _edit_status(
+                    status_msg,
+                    f"{_batch_header()}\n\n⏳ Moving to next file...\n\nUse /pause or /cancel."
+                )
 
             if cancelled:
                 break

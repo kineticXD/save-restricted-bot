@@ -82,5 +82,15 @@ class WaguriUpgradeTests(unittest.TestCase):
             self.assertIn(cmd, main_src)
 
 
+    def test_execute_batch_job_defines_scan_span_and_batch_header(self):
+        save_src = (ROOT / "plugins/save.py").read_text(encoding="utf-8")
+        fn_start = save_src.index("async def _execute_batch_job(")
+        fn_body = save_src[fn_start:]
+        self.assertIn("total_scan_span = sum(", fn_body)
+        self.assertIn("def _batch_header()", fn_body)
+        self.assertIn("_fmt_size(batch_bytes)", fn_body)
+        self.assertLess(fn_body.index("try:"), fn_body.index("status_msg = await message.reply_text("))
+
+
 if __name__ == "__main__":
     unittest.main()
